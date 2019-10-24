@@ -1,3 +1,5 @@
+# Maintainer:  yuk7 <yukx00@gmail.com>
+
 pkgname=systemd-altctl
 _pkgname=systemd
 pkgver=1.4.3027
