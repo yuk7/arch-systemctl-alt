@@ -2,7 +2,7 @@
 from __future__ import print_function
 
 __copyright__ = "(C) 2016-2019 Guido U. Draheim, licensed under the EUPL"
-__version__ = "1.4.3207"
+__version__ = "1.4.3424"
 
 import logging
 logg = logging.getLogger("systemctl")
@@ -1636,7 +1636,7 @@ class Systemctl:
         if not os.path.isdir(log_folder):
             os.makedirs(log_folder)
         return open(os.path.join(log_file), "a")
-    def chdir_workingdir(self, conf, check = True):
+    def chdir_workingdir(self, conf):
         """ if specified then change the working directory """
         # the original systemd will start in '/' even if User= is given
         if self._root:
@@ -1649,11 +1649,16 @@ class Systemctl:
                 ignore = True
             into = os_path(self._root, self.expand_special(workingdir, conf))
             try: 
-               return os.chdir(into)
+               logg.debug("chdir workingdir '%s'", into)
+               os.chdir(into)
+               return False
             except Exception as e:
                if not ignore:
                    logg.error("chdir workingdir '%s': %s", into, e)
-                   if check: raise
+                   return into
+               else:
+                   logg.debug("chdir workingdir '%s': %s", into, e)
+                   return None
         return None
     def notify_socket_from(self, conf, socketfile = None):
         """ creates a notify-socket for the (non-privileged) user """
@@ -1808,6 +1813,11 @@ class Systemctl:
                 run = subprocess_waitpid(forkpid)
                 logg.debug(" pre-start done (%s) <-%s>",
                     run.returncode or "OK", run.signal or "")
+                if run.returncode and check:
+                    logg.error("the ExecStartPre control process exited with error code")
+                    active = "failed"
+                    self.write_status_from(conf, AS=active )
+                    return False
         if runs in [ "sysv" ]:
             status_file = self.status_file_from(conf)
             if True:
@@ -2043,7 +2053,10 @@ class Systemctl:
         runuser = self.expand_special(conf.get("Service", "User", ""), conf)
         rungroup = self.expand_special(conf.get("Service", "Group", ""), conf)
         envs = shutil_setuid(runuser, rungroup)
-        self.chdir_workingdir(conf, check = False) # some dirs need setuid before
+        badpath = self.chdir_workingdir(conf) # some dirs need setuid before
+        if badpath:
+            logg.error("(%s): bad workingdir: '%s'", shell_cmd(cmd), badpath)
+            sys.exit(1)
         env = self.extend_exec_env(env)
         env.update(envs) # set $HOME to ~$USER
         try:
@@ -3980,18 +3993,21 @@ class Systemctl:
             if not conf: continue
             log_path = self.path_journal_log(conf)
             try:
-                opened = open(log_path, "rb")
-                fd = opened.fileno()
-                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                opened = os.open(log_path, os.O_RDONLY | os.O_NONBLOCK)
                 self._log_file[unit] = opened
                 self._log_hold[unit] = b""
             except Exception as e:
                 logg.error("can not open %s log: %s\n\t%s", unit, log_path, e)
     def read_log_files(self, units):
+        BUFSIZE=8192
         for unit in units:
             if unit in self._log_file:
-                new_text = self._log_file[unit].read()
+                new_text = b""
+                while True:
+                    buf = os.read(self._log_file[unit], BUFSIZE)
+                    if not buf: break
+                    new_text += buf
+                    continue
                 text = self._log_hold[unit] + new_text
                 if not text: continue
                 lines = text.split(b"\n")
@@ -4009,7 +4025,7 @@ class Systemctl:
             try:
                 if unit in self._log_file:
                     if self._log_file[unit]:
-                        self._log_file[unit].close()
+                        os.close(self._log_file[unit])
             except Exception as e:
                 logg.error("can not close log: %s\n\t%s", unit, e)
         self._log_file = {}
@@ -4057,6 +4073,10 @@ class Systemctl:
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
                 logg.info("interrupted - exit init-loop")
                 result = e.message or "STOPPED"
+                break
+            except Exception as e:
+                logg.info("interrupted - exception %s", e)
+                raise
         self.sysinit_status(ActiveState = None, SubState = "degraded")
         self.read_log_files(units)
         self.read_log_files(units)
