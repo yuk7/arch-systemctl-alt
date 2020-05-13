@@ -1,8 +1,10 @@
 #! /usr/bin/python
+## the systemctl*.py files are identical but for the default interpreter
+
 from __future__ import print_function
 
-__copyright__ = "(C) 2016-2019 Guido U. Draheim, licensed under the EUPL"
-__version__ = "1.4.3424"
+__copyright__ = "(C) 2016-2020 Guido U. Draheim, licensed under the EUPL"
+__version__ = "1.4.4181"
 
 import logging
 logg = logging.getLogger("systemctl")
@@ -90,6 +92,7 @@ DefaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ResetLocale = ["LANG", "LANGUAGE", "LC_CTYPE", "LC_NUMERIC", "LC_TIME", "LC_COLLATE", "LC_MONETARY",
                "LC_MESSAGES", "LC_PAPER", "LC_NAME", "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT",
                "LC_IDENTIFICATION", "LC_ALL"]
+LocaleConf="/etc/locale.conf"
 
 # The systemd default is NOTIFY_SOCKET="/var/run/systemd/notify"
 _notify_socket_folder = "/var/run/systemd" # alias /run/systemd
@@ -177,7 +180,7 @@ def _var_path(path):
     return path
 
 
-def shutil_setuid(user = None, group = None):
+def shutil_setuid(user = None, group = None, xgroups = None):
     """ set fork-child uid/gid (returns pw-info env-settings)"""
     if group:
         import grp
@@ -186,11 +189,18 @@ def shutil_setuid(user = None, group = None):
         logg.debug("setgid %s '%s'", gid, group)
     if user:
         import pwd
+        import grp
         pw = pwd.getpwnam(user)
+        gid = pw.pw_gid
+        gname = grp.getgrgid(gid).gr_name
         if not group:
-            gid = pw.pw_gid
             os.setgid(gid)
             logg.debug("setgid %s", gid)
+        groups = [g.gr_gid for g in grp.getgrall() if user in g.gr_mem]
+        if xgroups:
+            groups += [g.gr_gid for g in grp.getgrall() if g.gr_name in xgroups and g.gr_gid not in groups]
+        if groups:
+            os.setgroups(groups)
         uid = pw.pw_uid
         os.setuid(uid)
         logg.debug("setuid %s '%s'", uid, user)
@@ -939,7 +949,7 @@ class Systemctl:
             logg.debug("%s is /user/ conf >> accept", conf.filename())
             return False
         # to allow for 'docker run -u user' with system services
-        user = self.expand_special(conf.get("Service", "User", ""), conf)
+        user = self.get_User(conf)
         if user and user == self.user():
             logg.debug("%s with User=%s >> accept", conf.filename(), user)
             return False
@@ -966,7 +976,7 @@ class Systemctl:
         return result
     def load_sysd_template_conf(self, module): # -> conf?
         """ read the unit template with a UnitConfParser (systemd) """
-        if "@" in module:
+        if module and "@" in module:
             unit = parse_unit(module)
             service = "%s@.service" % unit.prefix
             return self.load_sysd_unit_conf(service)
@@ -1028,7 +1038,7 @@ class Systemctl:
         data = UnitConfParser()
         data.set("Unit","Id", module)
         data.set("Unit", "Names", module)
-        data.set("Unit", "Description", description or ("NOT-FOUND "+module))
+        data.set("Unit", "Description", description or ("NOT-FOUND " + str(module)))
         # assert(not data.loaded())
         conf = SystemctlConf(data, module)
         conf._root = self._root
@@ -1571,6 +1581,3004 @@ class Systemctl:
                 USER = os_getlogin()
                 HOME = get_home()
                 RUN = os.environ.get("XDG_RUNTIME_DIR", get_runtime_dir())
+                CONFIG = os.environ.get("XDG_CONFIG_HOME", HOME + "/.config")
+                CACHE = os.environ.get("XDG_CACHE_HOME", HOME + "/.cache")
+                SHARE = os.environ.get("XDG_DATA_HOME", HOME + "/.local/share")
+                DAT = CONFIG
+                LOG = os.path.join(CONFIG, "log")
+                SHELL = os.environ.get("SHELL", SHELL)
+                VARTMP = os.environ.get("TMPDIR", os.environ.get("TEMP", os.environ.get("TMP", VARTMP)))
+                TMP = os.environ.get("TMPDIR", os.environ.get("TEMP", os.environ.get("TMP", TMP)))
+            confs["V"] = os_path(self._root, VARTMP)
+            confs["T"] = os_path(self._root, TMP)
+            confs["t"] = os_path(self._root, RUN)
+            confs["S"] = os_path(self._root, DAT)
+            confs["s"] = SHELL
+            confs["h"] = HOME
+            confs["u"] = USER
+            confs["C"] = os_path(self._root, CACHE)
+            confs["E"] = os_path(self._root, CONFIG)
+            return confs
+        def get_conf1(m):
+            confs = get_confs(conf)
+            if m.group(1) in confs:
+                return confs[m.group(1)]
+            logg.warning("can not expand %%%s", m.group(1))
+            return "''" # empty escaped string
+        return re.sub("[%](.)", lambda m: get_conf1(m), cmd)
+    def exec_cmd(self, cmd, env, conf = None):
+        """ expand ExecCmd statements including %i and $MAINPID """
+        cmd1 = cmd.replace("\\\n","")
+        # according to documentation the %n / %% need to be expanded where in
+        # most cases they are shell-escaped values. So we do it before shlex.
+        cmd2 = self.expand_special(cmd1, conf)
+        # according to documentation, when bar="one two" then the expansion
+        # of '$bar' is ["one","two"] and '${bar}' becomes ["one two"]. We
+        # tackle that by expand $bar before shlex, and the rest thereafter.
+        def get_env1(m):
+            if m.group(1) in env:
+                return env[m.group(1)]
+            logg.debug("can not expand $%s", m.group(1))
+            return "" # empty string
+        def get_env2(m):
+            if m.group(1) in env:
+                return env[m.group(1)]
+            logg.debug("can not expand ${%s}", m.group(1))
+            return "" # empty string
+        cmd3 = re.sub("[$](\w+)", lambda m: get_env1(m), cmd2)
+        newcmd = []
+        for part in shlex.split(cmd3):
+            newcmd += [ re.sub("[$][{](\w+)[}]", lambda m: get_env2(m), part) ]
+        return newcmd
+    def path_journal_log(self, conf): # never None
+        """ /var/log/zzz.service.log or /var/log/default.unit.log """
+        filename = os.path.basename(conf.filename() or "")
+        unitname = (conf.name() or "default")+".unit"
+        name = filename or unitname
+        log_folder = conf.os_path_var(self._journal_log_folder)
+        log_file = name.replace(os.path.sep,".") + ".log"
+        if log_file.startswith("."):
+            log_file = "dot."+log_file
+        return os.path.join(log_folder, log_file)
+    def open_journal_log(self, conf):
+        log_file = self.path_journal_log(conf)
+        log_folder = os.path.dirname(log_file)
+        if not os.path.isdir(log_folder):
+            os.makedirs(log_folder)
+        return open(os.path.join(log_file), "a")
+    def chdir_workingdir(self, conf):
+        """ if specified then change the working directory """
+        # the original systemd will start in '/' even if User= is given
+        if self._root:
+            os.chdir(self._root)
+        workingdir = conf.get("Service", "WorkingDirectory", "")
+        if workingdir:
+            ignore = False
+            if workingdir.startswith("-"):
+                workingdir = workingdir[1:]
+                ignore = True
+            into = os_path(self._root, self.expand_special(workingdir, conf))
+            try: 
+               logg.debug("chdir workingdir '%s'", into)
+               os.chdir(into)
+               return False
+            except Exception as e:
+               if not ignore:
+                   logg.error("chdir workingdir '%s': %s", into, e)
+                   return into
+               else:
+                   logg.debug("chdir workingdir '%s': %s", into, e)
+                   return None
+        return None
+    def notify_socket_from(self, conf, socketfile = None):
+        """ creates a notify-socket for the (non-privileged) user """
+        NotifySocket = collections.namedtuple("NotifySocket", ["socket", "socketfile" ])
+        notify_socket_folder = conf.os_path_var(_notify_socket_folder)
+        notify_name = "notify." + str(conf.name() or "systemctl")
+        notify_socket = os.path.join(notify_socket_folder, notify_name)
+        socketfile = socketfile or notify_socket
+        if len(socketfile) > 100:
+            logg.debug("https://unix.stackexchange.com/questions/367008/%s",
+                       "why-is-socket-path-length-limited-to-a-hundred-chars")
+            logg.debug("old notify socketfile (%s) = %s", len(socketfile), socketfile)
+            notify_socket_folder = re.sub("^(/var)?", get_runtime_dir(), _notify_socket_folder)
+            notify_name = notify_name[0:min(100-len(notify_socket_folder),len(notify_name))]
+            socketfile = os.path.join(notify_socket_folder, notify_name)
+            # occurs during testsuite.py for ~user/test.tmp/root path
+            logg.info("new notify socketfile (%s) = %s", len(socketfile), socketfile)
+        try:
+            if not os.path.isdir(os.path.dirname(socketfile)):
+                os.makedirs(os.path.dirname(socketfile))
+            if os.path.exists(socketfile):
+                os.unlink(socketfile)
+        except Exception as e:
+            logg.warning("error %s: %s", socketfile, e)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(socketfile)
+        os.chmod(socketfile, 0o777) # the service my run under some User=setting
+        return NotifySocket(sock, socketfile)
+    def read_notify_socket(self, notify, timeout):
+        notify.socket.settimeout(timeout or DefaultMaximumTimeout)
+        result = ""
+        try:
+            result, client_address = notify.socket.recvfrom(4096)
+            if result:
+                result = result.decode("utf-8")
+                result_txt = result.replace("\n","|")
+                result_len = len(result)
+                logg.debug("read_notify_socket(%s):%s", result_len, result_txt)
+        except socket.timeout as e:
+            if timeout > 2:
+                logg.debug("socket.timeout %s", e)
+        return result
+    def wait_notify_socket(self, notify, timeout, pid = None):
+        if not os.path.exists(notify.socketfile):
+            logg.info("no $NOTIFY_SOCKET exists")
+            return {}
+        #
+        logg.info("wait $NOTIFY_SOCKET, timeout %s", timeout)
+        results = {}
+        seenREADY = None
+        for attempt in xrange(timeout+1):
+            if pid and not self.is_active_pid(pid):
+                logg.info("dead PID %s", pid)
+                return results
+            if not attempt: # first one
+                time.sleep(1) # until TimeoutStartSec
+                continue
+            result = self.read_notify_socket(notify, 1) # sleep max 1 second
+            if not result: # timeout
+                time.sleep(1) # until TimeoutStartSec
+                continue
+            for name, value in self.read_env_part(result):
+                results[name] = value
+                if name == "READY":
+                    seenREADY = value
+                if name in ["STATUS", "ACTIVESTATE"]:
+                    logg.debug("%s: %s", name, value) # TODO: update STATUS -> SubState
+            if seenREADY:
+                break
+        if not seenREADY:
+            logg.info(".... timeout while waiting for 'READY=1' status on $NOTIFY_SOCKET")
+        logg.debug("notify = %s", results)
+        try:
+            notify.socket.close()
+        except Exception as e:
+            logg.debug("socket.close %s", e)
+        return results
+    def start_modules(self, *modules):
+        """ [UNIT]... -- start these units
+        /// SPECIAL: with --now or --init it will
+            run the init-loop and stop the units afterwards """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        init = self._now or self._init
+        return self.start_units(units, init) and found_all
+    def start_units(self, units, init = None):
+        """ fails if any unit does not start
+        /// SPECIAL: may run the init-loop and 
+            stop the named units afterwards """
+        self.wait_system()
+        done = True
+        started_units = []
+        for unit in self.sortedAfter(units):
+            started_units.append(unit)
+            if not self.start_unit(unit):
+                done = False
+        if init:
+            logg.info("init-loop start")
+            sig = self.init_loop_until_stop(started_units)
+            logg.info("init-loop %s", sig)
+            for unit in reversed(started_units):
+                self.stop_unit(unit)
+        return done
+    def start_unit(self, unit):
+        conf = self.load_unit_conf(unit)
+        if conf is None:
+            logg.debug("unit could not be loaded (%s)", unit)
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        return self.start_unit_from(conf)
+    def get_TimeoutStartSec(self, conf):
+        timeout = conf.get("Service", "TimeoutSec", DefaultTimeoutStartSec)
+        timeout = conf.get("Service", "TimeoutStartSec", timeout)
+        return time_to_seconds(timeout, DefaultMaximumTimeout)
+    def start_unit_from(self, conf):
+        if not conf: return False
+        if self.syntax_check(conf) > 100: return False
+        with waitlock(conf):
+            logg.debug(" start unit %s => %s", conf.name(), conf.filename())
+            return self.do_start_unit_from(conf)
+    def do_start_unit_from(self, conf):
+        timeout = self.get_TimeoutStartSec(conf)
+        doRemainAfterExit = conf.getbool("Service", "RemainAfterExit", "no")
+        runs = conf.get("Service", "Type", "simple").lower()
+        env = self.get_env(conf)
+        self.exec_check_service(conf, env, "Exec") # all...
+        # for StopPost on failure:
+        returncode = 0
+        service_result = "success"
+        if True:
+            if runs in [ "simple", "forking", "notify", "idle" ]:
+                env["MAINPID"] = str(self.read_mainpid_from(conf, ""))
+            for cmd in conf.getlist("Service", "ExecStartPre", []):
+                check, cmd = checkstatus(cmd)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info(" pre-start %s", shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid: 
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                logg.debug(" pre-start done (%s) <-%s>",
+                    run.returncode or "OK", run.signal or "")
+                if run.returncode and check:
+                    logg.error("the ExecStartPre control process exited with error code")
+                    active = "failed"
+                    self.write_status_from(conf, AS=active )
+                    return False
+        if runs in [ "sysv" ]:
+            status_file = self.status_file_from(conf)
+            if True:
+                exe = conf.filename()
+                cmd = "'%s' start" % exe
+                env["SYSTEMCTL_SKIP_REDIRECT"] = "yes"
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s start %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid: # pragma: no cover
+                    os.setsid() # detach child process from parent
+                    self.execve_from(conf, newcmd, env)
+                run = subprocess_waitpid(forkpid)
+                self.set_status_from(conf, "ExecMainCode", run.returncode)
+                logg.info("%s start done (%s) <-%s>", runs, 
+                    run.returncode or "OK", run.signal or "")
+                active = run.returncode and "failed" or "active"
+                self.write_status_from(conf, AS=active )
+                return True
+        elif runs in [ "oneshot" ]:
+            status_file = self.status_file_from(conf)
+            if self.get_status_from(conf, "ActiveState", "unknown") == "active":
+                logg.warning("the service was already up once")
+                return True
+            for cmd in conf.getlist("Service", "ExecStart", []):
+                check, cmd = checkstatus(cmd)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s start %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid: # pragma: no cover
+                    os.setsid() # detach child process from parent
+                    self.execve_from(conf, newcmd, env)
+                run = subprocess_waitpid(forkpid)
+                if run.returncode and check: 
+                    returncode = run.returncode
+                    service_result = "failed"
+                    logg.error("%s start %s (%s) <-%s>", runs, service_result, 
+                        run.returncode or "OK", run.signal or "")
+                    break
+                logg.info("%s start done (%s) <-%s>", runs, 
+                    run.returncode or "OK", run.signal or "")
+            if True:
+                self.set_status_from(conf, "ExecMainCode", returncode)
+                active = returncode and "failed" or "active"
+                self.write_status_from(conf, AS=active)
+        elif runs in [ "simple", "idle" ]:
+            status_file = self.status_file_from(conf)
+            pid = self.read_mainpid_from(conf, "")
+            if self.is_active_pid(pid):
+                logg.warning("the service is already running on PID %s", pid)
+                return True
+            if doRemainAfterExit:
+                logg.debug("%s RemainAfterExit -> AS=active", runs)
+                self.write_status_from(conf, AS="active")
+            cmdlist = conf.getlist("Service", "ExecStart", [])
+            for idx, cmd in enumerate(cmdlist):
+                logg.debug("ExecStart[%s]: %s", idx, cmd)
+            for cmd in cmdlist:
+                pid = self.read_mainpid_from(conf, "")
+                env["MAINPID"] = str(pid)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s start %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid: # pragma: no cover
+                    os.setsid() # detach child process from parent
+                    self.execve_from(conf, newcmd, env)
+                self.write_status_from(conf, MainPID=forkpid)
+                logg.info("%s started PID %s", runs, forkpid)
+                env["MAINPID"] = str(forkpid)
+                time.sleep(MinimumYield)
+                run = subprocess_testpid(forkpid)
+                if run.returncode is not None:
+                    logg.info("%s stopped PID %s (%s) <-%s>", runs, run.pid, 
+                        run.returncode or "OK", run.signal or "")
+                    if doRemainAfterExit:
+                        self.set_status_from(conf, "ExecMainCode", run.returncode)
+                        active = run.returncode and "failed" or "active"
+                        self.write_status_from(conf, AS=active)
+                    if run.returncode:
+                        service_result = "failed"
+                        break
+        elif runs in [ "notify" ]:
+            # "notify" is the same as "simple" but we create a $NOTIFY_SOCKET 
+            # and wait for startup completion by checking the socket messages
+            pid = self.read_mainpid_from(conf, "")
+            if self.is_active_pid(pid):
+                logg.error("the service is already running on PID %s", pid)
+                return False
+            notify = self.notify_socket_from(conf)
+            if notify:
+                env["NOTIFY_SOCKET"] = notify.socketfile
+                logg.debug("use NOTIFY_SOCKET=%s", notify.socketfile)
+            if doRemainAfterExit:
+                logg.debug("%s RemainAfterExit -> AS=active", runs)
+                self.write_status_from(conf, AS="active")
+            cmdlist = conf.getlist("Service", "ExecStart", [])
+            for idx, cmd in enumerate(cmdlist):
+                logg.debug("ExecStart[%s]: %s", idx, cmd)
+            mainpid = None
+            for cmd in cmdlist:
+                mainpid = self.read_mainpid_from(conf, "")
+                env["MAINPID"] = str(mainpid)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s start %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid: # pragma: no cover
+                    os.setsid() # detach child process from parent
+                    self.execve_from(conf, newcmd, env)
+                # via NOTIFY # self.write_status_from(conf, MainPID=forkpid)
+                logg.info("%s started PID %s", runs, forkpid)
+                mainpid = forkpid
+                self.write_status_from(conf, MainPID=mainpid)
+                env["MAINPID"] = str(mainpid)
+                time.sleep(MinimumYield)
+                run = subprocess_testpid(forkpid)
+                if run.returncode is not None:
+                    logg.info("%s stopped PID %s (%s) <-%s>", runs, run.pid, 
+                        run.returncode or "OK", run.signal or "")
+                    if doRemainAfterExit:
+                        self.set_status_from(conf, "ExecMainCode", run.returncode or 0)
+                        active = run.returncode and "failed" or "active"
+                        self.write_status_from(conf, AS=active)
+                    if run.returncode:
+                        service_result = "failed"
+                        break
+            if service_result in [ "success" ] and mainpid:
+                logg.debug("okay, wating on socket for %ss", timeout)
+                results = self.wait_notify_socket(notify, timeout, mainpid)
+                if "MAINPID" in results:
+                    new_pid = results["MAINPID"]
+                    if new_pid and to_int(new_pid) != mainpid:
+                        logg.info("NEW PID %s from sd_notify (was PID %s)", new_pid, mainpid)
+                        self.write_status_from(conf, MainPID=new_pid)
+                        mainpid = new_pid
+                logg.info("%s start done %s", runs, mainpid)
+                pid = self.read_mainpid_from(conf, "")
+                if pid:
+                    env["MAINPID"] = str(pid)
+                else:
+                    service_result = "timeout" # "could not start service"
+        elif runs in [ "forking" ]:
+            pid_file = self.pid_file_from(conf)
+            for cmd in conf.getlist("Service", "ExecStart", []):
+                check, cmd = checkstatus(cmd)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                if not newcmd: continue
+                logg.info("%s start %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid: # pragma: no cover
+                    os.setsid() # detach child process from parent
+                    self.execve_from(conf, newcmd, env)
+                logg.info("%s started PID %s", runs, forkpid)
+                run = subprocess_waitpid(forkpid)
+                if run.returncode and check:
+                    returncode = run.returncode
+                    service_result = "failed"
+                logg.info("%s stopped PID %s (%s) <-%s>", runs, run.pid, 
+                    run.returncode or "OK", run.signal or "")
+            if pid_file and service_result in [ "success" ]:
+                pid = self.wait_pid_file(pid_file) # application PIDFile
+                logg.info("%s start done PID %s [%s]", runs, pid, pid_file)
+                if pid:
+                    env["MAINPID"] = str(pid)
+            if not pid_file:
+                time.sleep(MinimumTimeoutStartSec)
+                logg.warning("No PIDFile for forking %s", conf.filename())
+                status_file = self.status_file_from(conf)
+                self.set_status_from(conf, "ExecMainCode", returncode)
+                active = returncode and "failed" or "active"
+                self.write_status_from(conf, AS=active)
+        else:
+            logg.error("unsupported run type '%s'", runs)
+            return False
+        # POST sequence
+        active = self.is_active_from(conf)
+        if not active:
+            logg.warning("%s start not active", runs)
+            # according to the systemd documentation, a failed start-sequence
+            # should execute the ExecStopPost sequence allowing some cleanup.
+            env["SERVICE_RESULT"] = service_result
+            for cmd in conf.getlist("Service", "ExecStopPost", []):
+                check, cmd = checkstatus(cmd)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("post-fail %s", shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                logg.debug("post-fail done (%s) <-%s>", 
+                    run.returncode or "OK", run.signal or "")
+            return False
+        else:
+            for cmd in conf.getlist("Service", "ExecStartPost", []):
+                check, cmd = checkstatus(cmd)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("post-start %s", shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                logg.debug("post-start done (%s) <-%s>", 
+                    run.returncode or "OK", run.signal or "")
+            return True
+    def extend_exec_env(self, env):
+        env = env.copy()
+        # implant DefaultPath into $PATH
+        path = env.get("PATH", DefaultPath)
+        parts = path.split(os.pathsep)
+        for part in DefaultPath.split(os.pathsep):
+            if part and part not in parts:
+                parts.append(part)
+        env["PATH"] = str(os.pathsep).join(parts)
+        # reset locale to system default
+        for name in ResetLocale:
+            if name in env:
+                del env[name]
+        locale = {}
+        path = env.get("LOCALE_CONF", LocaleConf)
+        parts = path.split(os.pathsep)
+        for part in parts:
+            if os.path.isfile(part):
+                for var, val in self.read_env_file("-"+part):
+                    locale[var] = val
+                    env[var] = val
+        if "LANG" not in locale:
+            env["LANG"] = locale.get("LANGUAGE", locale.get("LC_CTYPE", "C"))
+        return env
+    def expand_list(self, group_lines, conf):
+        result = []
+        for line in group_lines:
+            for item in line.split():
+                if item:
+                    result.append(self.expand_special(item, conf))
+        return result
+    def get_User(self, conf):
+        return self.expand_special(conf.get("Service", "User", ""), conf)
+    def get_Group(self, conf):
+        return self.expand_special(conf.get("Service", "Group", ""), conf)
+    def get_SupplementaryGroups(self, conf):
+        return self.expand_list(conf.getlist("Service", "SupplementaryGroups", []), conf)
+    def execve_from(self, conf, cmd, env):
+        """ this code is commonly run in a child process // returns exit-code"""
+        runs = conf.get("Service", "Type", "simple").lower()
+        logg.debug("%s process for %s", runs, conf.filename())
+        inp = open("/dev/zero")
+        out = self.open_journal_log(conf)
+        os.dup2(inp.fileno(), sys.stdin.fileno())
+        os.dup2(out.fileno(), sys.stdout.fileno())
+        os.dup2(out.fileno(), sys.stderr.fileno())
+        runuser = self.get_User(conf)
+        rungroup = self.get_Group(conf)
+        xgroups = self.get_SupplementaryGroups(conf)
+        envs = shutil_setuid(runuser, rungroup, xgroups)
+        badpath = self.chdir_workingdir(conf) # some dirs need setuid before
+        if badpath:
+            logg.error("(%s): bad workingdir: '%s'", shell_cmd(cmd), badpath)
+            sys.exit(1)
+        env = self.extend_exec_env(env)
+        env.update(envs) # set $HOME to ~$USER
+        try:
+            if "spawn" in COVERAGE:
+                os.spawnvpe(os.P_WAIT, cmd[0], cmd, env)
+                sys.exit(0)
+            else: # pragma: nocover
+                os.execve(cmd[0], cmd, env)
+        except Exception as e:
+            logg.error("(%s): %s", shell_cmd(cmd), e)
+            sys.exit(1)
+    def test_start_unit(self, unit):
+        """ helper function to test the code that is normally forked off """
+        conf = self.load_unit_conf(unit)
+        env = self.get_env(conf)
+        for cmd in conf.getlist("Service", "ExecStart", []):
+            newcmd = self.exec_cmd(cmd, env, conf)
+            return self.execve_from(conf, newcmd, env)
+        return None
+    def stop_modules(self, *modules):
+        """ [UNIT]... -- stop these units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.stop_units(units) and found_all
+    def stop_units(self, units):
+        """ fails if any unit fails to stop """
+        self.wait_system()
+        done = True
+        for unit in self.sortedBefore(units):
+            if not self.stop_unit(unit):
+                done = False
+        return done
+    def stop_unit(self, unit):
+        conf = self.load_unit_conf(unit)
+        if conf is None:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        return self.stop_unit_from(conf)
+
+    def get_TimeoutStopSec(self, conf):
+        timeout = conf.get("Service", "TimeoutSec", DefaultTimeoutStartSec)
+        timeout = conf.get("Service", "TimeoutStopSec", timeout)
+        return time_to_seconds(timeout, DefaultMaximumTimeout)
+    def stop_unit_from(self, conf):
+        if not conf: return False
+        if self.syntax_check(conf) > 100: return False
+        with waitlock(conf):
+            logg.info(" stop unit %s => %s", conf.name(), conf.filename())
+            return self.do_stop_unit_from(conf)
+    def do_stop_unit_from(self, conf):
+        timeout = self.get_TimeoutStopSec(conf)
+        runs = conf.get("Service", "Type", "simple").lower()
+        env = self.get_env(conf)
+        self.exec_check_service(conf, env, "ExecStop")
+        returncode = 0
+        service_result = "success"
+        if runs in [ "sysv" ]:
+            status_file = self.status_file_from(conf)
+            if True:
+                exe = conf.filename()
+                cmd = "'%s' stop" % exe
+                env["SYSTEMCTL_SKIP_REDIRECT"] = "yes"
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s stop %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                if run.returncode:
+                    self.set_status_from(conf, "ExecStopCode", run.returncode)
+                    self.write_status_from(conf, AS="failed")
+                else:
+                    self.clean_status_from(conf) # "inactive"
+                return True
+        elif runs in [ "oneshot" ]:
+            status_file = self.status_file_from(conf)
+            if self.get_status_from(conf, "ActiveState", "unknown") == "inactive":
+                logg.warning("the service is already down once")
+                return True
+            for cmd in conf.getlist("Service", "ExecStop", []):
+                check, cmd = checkstatus(cmd)
+                logg.debug("{env} %s", env)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s stop %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                if run.returncode and check: 
+                    returncode = run.returncode
+                    service_result = "failed"
+                    break
+            if True:
+                if returncode:
+                    self.set_status_from(conf, "ExecStopCode", returncode)
+                    self.write_status_from(conf, AS="failed")
+                else:
+                    self.clean_status_from(conf) # "inactive"
+        ### fallback Stop => Kill for ["simple","notify","forking"]
+        elif not conf.getlist("Service", "ExecStop", []):
+            logg.info("no ExecStop => systemctl kill")
+            if True:
+                self.do_kill_unit_from(conf)
+                self.clean_pid_file_from(conf)
+                self.clean_status_from(conf) # "inactive"
+        elif runs in [ "simple", "notify", "idle" ]:
+            status_file = self.status_file_from(conf)
+            size = os.path.exists(status_file) and os.path.getsize(status_file)
+            logg.info("STATUS %s %s", status_file, size)
+            pid = 0
+            for cmd in conf.getlist("Service", "ExecStop", []):
+                check, cmd = checkstatus(cmd)
+                env["MAINPID"] = str(self.read_mainpid_from(conf, ""))
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s stop %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                run = must_have_failed(run, newcmd) # TODO: a workaround
+                # self.write_status_from(conf, MainPID=run.pid) # no ExecStop
+                if run.returncode and check:
+                    returncode = run.returncode
+                    service_result = "failed"
+                    break
+            pid = env.get("MAINPID",0)
+            if pid:
+                if self.wait_vanished_pid(pid, timeout):
+                    self.clean_pid_file_from(conf)
+                    self.clean_status_from(conf) # "inactive"
+            else:
+                logg.info("%s sleep as no PID was found on Stop", runs)
+                time.sleep(MinimumTimeoutStopSec)
+                pid = self.read_mainpid_from(conf, "")
+                if not pid or not pid_exists(pid) or pid_zombie(pid):
+                    self.clean_pid_file_from(conf)
+                self.clean_status_from(conf) # "inactive"
+        elif runs in [ "forking" ]:
+            status_file = self.status_file_from(conf)
+            pid_file = self.pid_file_from(conf)
+            for cmd in conf.getlist("Service", "ExecStop", []):
+                active = self.is_active_from(conf)
+                if pid_file:
+                    new_pid = self.read_mainpid_from(conf, "")
+                    if new_pid:
+                        env["MAINPID"] = str(new_pid)
+                check, cmd = checkstatus(cmd)
+                logg.debug("{env} %s", env)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("fork stop %s", shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                if run.returncode and check:
+                    returncode = run.returncode
+                    service_result = "failed"
+                    break
+            pid = env.get("MAINPID",0)
+            if pid:
+                if self.wait_vanished_pid(pid, timeout):
+                    self.clean_pid_file_from(conf)
+            else:
+                logg.info("%s sleep as no PID was found on Stop", runs)
+                time.sleep(MinimumTimeoutStopSec)
+                pid = self.read_mainpid_from(conf, "")
+                if not pid or not pid_exists(pid) or pid_zombie(pid):
+                    self.clean_pid_file_from(conf)
+            if returncode:
+                if os.path.isfile(status_file):
+                    self.set_status_from(conf, "ExecStopCode", returncode)
+                    self.write_status_from(conf, AS="failed")
+            else:
+                self.clean_status_from(conf) # "inactive"
+        else:
+            logg.error("unsupported run type '%s'", runs)
+            return False
+        # POST sequence
+        active = self.is_active_from(conf)
+        if not active:
+            env["SERVICE_RESULT"] = service_result
+            for cmd in conf.getlist("Service", "ExecStopPost", []):
+                check, cmd = checkstatus(cmd)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("post-stop %s", shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                logg.debug("post-stop done (%s) <-%s>", 
+                    run.returncode or "OK", run.signal or "")
+        return service_result == "success"
+    def wait_vanished_pid(self, pid, timeout):
+        if not pid:
+            return True
+        logg.info("wait for PID %s to vanish (%ss)", pid, timeout)
+        for x in xrange(int(timeout)):
+            if not self.is_active_pid(pid):
+                logg.info("wait for PID %s is done (%s.)", pid, x)
+                return True
+            time.sleep(1) # until TimeoutStopSec
+        logg.info("wait for PID %s failed (%s.)", pid, x)
+        return False
+    def reload_modules(self, *modules):
+        """ [UNIT]... -- reload these units """
+        self.wait_system()
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.reload_units(units) and found_all
+    def reload_units(self, units):
+        """ fails if any unit fails to reload """
+        self.wait_system()
+        done = True
+        for unit in self.sortedAfter(units):
+            if not self.reload_unit(unit):
+                done = False
+        return done
+    def reload_unit(self, unit):
+        conf = self.load_unit_conf(unit)
+        if conf is None:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        return self.reload_unit_from(conf)
+    def reload_unit_from(self, conf):
+        if not conf: return False
+        if self.syntax_check(conf) > 100: return False
+        with waitlock(conf):
+            logg.info(" reload unit %s => %s", conf.name(), conf.filename())
+            return self.do_reload_unit_from(conf)
+    def do_reload_unit_from(self, conf):
+        runs = conf.get("Service", "Type", "simple").lower()
+        env = self.get_env(conf)
+        self.exec_check_service(conf, env, "ExecReload")
+        if runs in [ "sysv" ]:
+            status_file = self.status_file_from(conf)
+            if True:
+                exe = conf.filename()
+                cmd = "'%s' reload" % exe
+                env["SYSTEMCTL_SKIP_REDIRECT"] = "yes"
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s reload %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                self.set_status_from(conf, "ExecReloadCode", run.returncode)
+                if run.returncode:
+                    self.write_status_from(conf, AS="failed")
+                    return False
+                else:
+                    self.write_status_from(conf, AS="active")
+                    return True
+        elif runs in [ "simple", "notify", "forking", "idle" ]:
+            if not self.is_active_from(conf):
+                logg.info("no reload on inactive service %s", conf.name())
+                return True
+            for cmd in conf.getlist("Service", "ExecReload", []):
+                env["MAINPID"] = str(self.read_mainpid_from(conf, ""))
+                check, cmd = checkstatus(cmd)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                logg.info("%s reload %s", runs, shell_cmd(newcmd))
+                forkpid = os.fork()
+                if not forkpid:
+                    self.execve_from(conf, newcmd, env) # pragma: nocover
+                run = subprocess_waitpid(forkpid)
+                if check and run.returncode: 
+                    logg.error("Job for %s failed because the control process exited with error code. (%s)", 
+                        conf.name(), run.returncode)
+                    return False
+            time.sleep(MinimumYield)
+            return True
+        elif runs in [ "oneshot" ]:
+            logg.debug("ignored run type '%s' for reload", runs)
+            return True
+        else:
+            logg.error("unsupported run type '%s'", runs)
+            return False
+    def restart_modules(self, *modules):
+        """ [UNIT]... -- restart these units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.restart_units(units) and found_all
+    def restart_units(self, units):
+        """ fails if any unit fails to restart """
+        self.wait_system()
+        done = True
+        for unit in self.sortedAfter(units):
+            if not self.restart_unit(unit):
+                done = False
+        return done
+    def restart_unit(self, unit):
+        conf = self.load_unit_conf(unit)
+        if conf is None:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        return self.restart_unit_from(conf)
+    def restart_unit_from(self, conf):
+        if not conf: return False
+        if self.syntax_check(conf) > 100: return False
+        with waitlock(conf):
+            logg.info(" restart unit %s => %s", conf.name(), conf.filename())
+            if not self.is_active_from(conf):
+                return self.do_start_unit_from(conf)
+            else:
+                return self.do_restart_unit_from(conf)
+    def do_restart_unit_from(self, conf):
+        logg.info("(restart) => stop/start")
+        self.do_stop_unit_from(conf)
+        return self.do_start_unit_from(conf)
+    def try_restart_modules(self, *modules):
+        """ [UNIT]... -- try-restart these units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.try_restart_units(units) and found_all
+    def try_restart_units(self, units):
+        """ fails if any module fails to try-restart """
+        self.wait_system()
+        done = True
+        for unit in self.sortedAfter(units):
+            if not self.try_restart_unit(unit):
+                done = False
+        return done
+    def try_restart_unit(self, unit):
+        """ only do 'restart' if 'active' """
+        conf = self.load_unit_conf(unit)
+        if conf is None:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        with waitlock(conf):
+            logg.info(" try-restart unit %s => %s", conf.name(), conf.filename())
+            if self.is_active_from(conf):
+                return self.do_restart_unit_from(conf)
+        return True
+    def reload_or_restart_modules(self, *modules):
+        """ [UNIT]... -- reload-or-restart these units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.reload_or_restart_units(units) and found_all
+    def reload_or_restart_units(self, units):
+        """ fails if any unit does not reload-or-restart """
+        self.wait_system()
+        done = True
+        for unit in self.sortedAfter(units):
+            if not self.reload_or_restart_unit(unit):
+                done = False
+        return done
+    def reload_or_restart_unit(self, unit):
+        """ do 'reload' if specified, otherwise do 'restart' """
+        conf = self.load_unit_conf(unit)
+        if conf is None:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        return self.reload_or_restart_unit_from(conf)
+    def reload_or_restart_unit_from(self, conf):
+        """ do 'reload' if specified, otherwise do 'restart' """
+        if not conf: return False
+        with waitlock(conf):
+            logg.info(" reload-or-restart unit %s => %s", conf.name(), conf.filename())
+            return self.do_reload_or_restart_unit_from(conf)
+    def do_reload_or_restart_unit_from(self, conf):
+        if not self.is_active_from(conf):
+            # try: self.stop_unit_from(conf)
+            # except Exception as e: pass
+            return self.do_start_unit_from(conf)
+        elif conf.getlist("Service", "ExecReload", []):
+            logg.info("found service to have ExecReload -> 'reload'")
+            return self.do_reload_unit_from(conf)
+        else:
+            logg.info("found service without ExecReload -> 'restart'")
+            return self.do_restart_unit_from(conf)
+    def reload_or_try_restart_modules(self, *modules):
+        """ [UNIT]... -- reload-or-try-restart these units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.reload_or_try_restart_units(units) and found_all
+    def reload_or_try_restart_units(self, units):
+        """ fails if any unit fails to reload-or-try-restart """
+        self.wait_system()
+        done = True
+        for unit in self.sortedAfter(units):
+            if not self.reload_or_try_restart_unit(unit):
+                done = False
+        return done
+    def reload_or_try_restart_unit(self, unit):
+        conf = self.load_unit_conf(unit)
+        if conf is None:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        return self.reload_or_try_restart_unit_from(conf)
+    def reload_or_try_restart_unit_from(self, conf):
+        with waitlock(conf):
+            logg.info(" reload-or-try-restart unit %s => %s", conf.name(), conf.filename())
+            return self.do_reload_or_try_restart_unit_from(conf)
+    def do_reload_or_try_restart_unit_from(self, conf):
+        if conf.getlist("Service", "ExecReload", []):
+            return self.do_reload_unit_from(conf)
+        elif not self.is_active_from(conf):
+            return True
+        else:
+            return self.do_restart_unit_from(conf)
+    def kill_modules(self, *modules):
+        """ [UNIT]... -- kill these units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.kill_units(units) and found_all
+    def kill_units(self, units):
+        """ fails if any unit could not be killed """
+        self.wait_system()
+        done = True
+        for unit in self.sortedBefore(units):
+            if not self.kill_unit(unit):
+                done = False
+        return done
+    def kill_unit(self, unit):
+        conf = self.load_unit_conf(unit)
+        if conf is None:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        return self.kill_unit_from(conf)
+    def kill_unit_from(self, conf):
+        if not conf: return False
+        with waitlock(conf):
+            logg.info(" kill unit %s => %s", conf.name(), conf.filename())
+            return self.do_kill_unit_from(conf)
+    def do_kill_unit_from(self, conf):
+        started = time.time()
+        doSendSIGKILL = conf.getbool("Service", "SendSIGKILL", "yes")
+        doSendSIGHUP = conf.getbool("Service", "SendSIGHUP", "no")
+        useKillMode = conf.get("Service", "KillMode", "control-group")
+        useKillSignal = conf.get("Service", "KillSignal", "SIGTERM")
+        kill_signal = getattr(signal, useKillSignal)
+        timeout = self.get_TimeoutStopSec(conf)
+        status_file = self.status_file_from(conf)
+        size = os.path.exists(status_file) and os.path.getsize(status_file)
+        logg.info("STATUS %s %s", status_file, size)
+        mainpid = to_int(self.read_mainpid_from(conf, ""))
+        self.clean_status_from(conf) # clear RemainAfterExit and TimeoutStartSec
+        if not mainpid:
+            if useKillMode in ["control-group"]:
+                logg.warning("no main PID [%s]", conf.filename())
+                logg.warning("and there is no control-group here")
+            else:
+                logg.info("no main PID [%s]", conf.filename())
+            return False
+        if not pid_exists(mainpid) or pid_zombie(mainpid):
+            logg.debug("ignoring children when mainpid is already dead")
+            # because we list child processes, not processes in control-group
+            return True
+        pidlist = self.pidlist_of(mainpid) # here
+        if pid_exists(mainpid):
+            logg.info("stop kill PID %s", mainpid)
+            self._kill_pid(mainpid, kill_signal)
+        if useKillMode in ["control-group"]:
+            if len(pidlist) > 1:
+                logg.info("stop control-group PIDs %s", pidlist)
+            for pid in pidlist:
+                if pid != mainpid:
+                    self._kill_pid(pid, kill_signal)
+        if doSendSIGHUP: 
+            logg.info("stop SendSIGHUP to PIDs %s", pidlist)
+            for pid in pidlist:
+                self._kill_pid(pid, signal.SIGHUP)
+        # wait for the processes to have exited
+        while True:
+            dead = True
+            for pid in pidlist:
+                if pid_exists(pid) and not pid_zombie(pid):
+                    dead = False
+                    break
+            if dead:
+                break
+            if time.time() > started + timeout:
+                logg.info("service PIDs not stopped after %s", timeout)
+                break
+            time.sleep(1) # until TimeoutStopSec
+        if dead or not doSendSIGKILL:
+            logg.info("done kill PID %s %s", mainpid, dead and "OK")
+            return dead
+        if useKillMode in [ "control-group", "mixed" ]:
+            logg.info("hard kill PIDs %s", pidlist)
+            for pid in pidlist:
+                if pid != mainpid:
+                    self._kill_pid(pid, signal.SIGKILL)
+            time.sleep(MinimumYield)
+        # useKillMode in [ "control-group", "mixed", "process" ]
+        if pid_exists(mainpid):
+            logg.info("hard kill PID %s", mainpid)
+            self._kill_pid(mainpid, signal.SIGKILL)
+            time.sleep(MinimumYield)
+        dead = not pid_exists(mainpid) or pid_zombie(mainpid)
+        logg.info("done hard kill PID %s %s", mainpid, dead and "OK")
+        return dead
+    def _kill_pid(self, pid, kill_signal = None):
+        try: 
+            sig = kill_signal or signal.SIGTERM
+            os.kill(pid, sig)
+        except OSError as e:
+            if e.errno == errno.ESRCH or e.errno == errno.ENOENT:
+                logg.debug("kill PID %s => No such process", pid)
+                return True
+            else:
+                logg.error("kill PID %s => %s", pid, str(e))
+                return False
+        return not pid_exists(pid) or pid_zombie(pid)
+    def is_active_modules(self, *modules):
+        """ [UNIT].. -- check if these units are in active state
+        implements True if all is-active = True """
+        # systemctl returns multiple lines, one for each argument
+        #   "active" when is_active
+        #   "inactive" when not is_active
+        #   "unknown" when not enabled
+        # The return code is set to
+        #   0 when "active"
+        #   1 when unit is not found
+        #   3 when any "inactive" or "unknown"
+        # However: # TODO!!!!! BUG in original systemctl!!
+        #   documentation says " exit code 0 if at least one is active"
+        #   and "Unless --quiet is specified, print the unit state"
+        units = []
+        results = []
+        for module in modules:
+            units = self.match_units([ module ])
+            if not units:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                results += [ "unknown" ]
+                continue
+            for unit in units:
+                active = self.get_active_unit(unit) 
+                enabled = self.enabled_unit(unit)
+                if enabled != "enabled": active = "unknown"
+                results += [ active ]
+                break
+        ## how it should work:
+        status = "active" in results
+        ## how 'systemctl' works:
+        non_active = [ result for result in results if result != "active" ]
+        status = not non_active
+        if not status:
+            status = 3
+        if not _quiet:
+            return status, results
+        else:
+            return status
+    def is_active_from(self, conf):
+        """ used in try-restart/other commands to check if needed. """
+        if not conf: return False
+        return self.get_active_from(conf) == "active"
+    def active_pid_from(self, conf):
+        if not conf: return False
+        pid = self.read_mainpid_from(conf, "")
+        return self.is_active_pid(pid)
+    def is_active_pid(self, pid):
+        """ returns pid if the pid is still an active process """
+        if pid and pid_exists(pid) and not pid_zombie(pid):
+            return pid # usually a string (not null)
+        return None
+    def get_active_unit(self, unit):
+        """ returns 'active' 'inactive' 'failed' 'unknown' """
+        conf = self.get_unit_conf(unit)
+        if not conf.loaded():
+            logg.warning("Unit %s could not be found.", unit)
+            return "unknown"
+        else:
+            return self.get_active_from(conf)
+    def get_active_from(self, conf):
+        """ returns 'active' 'inactive' 'failed' 'unknown' """
+        # used in try-restart/other commands to check if needed.
+        if not conf: return "unknown"
+        pid_file = self.pid_file_from(conf)
+        if pid_file: # application PIDFile
+            if not os.path.exists(pid_file):
+                return "inactive"
+        status_file = self.status_file_from(conf)
+        if self.getsize(status_file):
+            state = self.get_status_from(conf, "ActiveState", "")
+            if state:
+                logg.info("get_status_from %s => %s", conf.name(), state)
+                return state
+        pid = self.read_mainpid_from(conf, "")
+        logg.debug("pid_file '%s' => PID %s", pid_file or status_file, pid)
+        if pid:
+            if not pid_exists(pid) or pid_zombie(pid):
+                return "failed"
+            return "active"
+        else:
+            return "inactive"
+    def get_substate_from(self, conf):
+        """ returns 'running' 'exited' 'dead' 'failed' 'plugged' 'mounted' """
+        if not conf: return False
+        pid_file = self.pid_file_from(conf)
+        if pid_file:
+            if not os.path.exists(pid_file):
+                return "dead"
+        status_file = self.status_file_from(conf)
+        if self.getsize(status_file):
+            state = self.get_status_from(conf, "ActiveState", "")
+            if state:
+                if state in [ "active" ]:
+                    return self.get_status_from(conf, "SubState", "running")
+                else:
+                    return self.get_status_from(conf, "SubState", "dead")
+        pid = self.read_mainpid_from(conf, "")
+        logg.debug("pid_file '%s' => PID %s", pid_file or status_file, pid)
+        if pid:
+            if not pid_exists(pid) or pid_zombie(pid):
+                return "failed"
+            return "running"
+        else:
+            return "dead"
+    def is_failed_modules(self, *modules):
+        """ [UNIT]... -- check if these units are in failes state
+        implements True if any is-active = True """
+        units = []
+        results = []
+        for module in modules:
+            units = self.match_units([ module ])
+            if not units:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                results += [ "unknown" ]
+                continue
+            for unit in units:
+                active = self.get_active_unit(unit) 
+                enabled = self.enabled_unit(unit)
+                if enabled != "enabled": active = "unknown"
+                results += [ active ]
+                break
+        status = "failed" in results
+        if not _quiet:
+            return status, results
+        else:
+            return status
+    def is_failed_from(self, conf):
+        if conf is None: return True
+        return self.get_active_from(conf) == "failed"
+    def reset_failed_modules(self, *modules):
+        """ [UNIT]... -- Reset failed state for all, one, or more units """
+        units = []
+        status = True
+        for module in modules:
+            units = self.match_units([ module ])
+            if not units:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                return 1
+            for unit in units:
+                if not self.reset_failed_unit(unit):
+                    logg.error("Unit %s could not be reset.", unit_of(module))
+                    status = False
+                break
+        return status
+    def reset_failed_unit(self, unit):
+        conf = self.get_unit_conf(unit)
+        if not conf.loaded():
+            logg.warning("Unit %s could not be found.", unit)
+            return False
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        return self.reset_failed_from(conf)
+    def reset_failed_from(self, conf):
+        if conf is None: return True
+        if not self.is_failed_from(conf): return False
+        done = False
+        status_file = self.status_file_from(conf)
+        if status_file and os.path.exists(status_file):
+            try:
+                os.remove(status_file)
+                done = True
+                logg.debug("done rm %s", status_file)
+            except Exception as e:
+                logg.error("while rm %s: %s", status_file, e)
+        pid_file = self.pid_file_from(conf)
+        if pid_file and os.path.exists(pid_file):
+            try:
+                os.remove(pid_file)
+                done = True
+                logg.debug("done rm %s", pid_file)
+            except Exception as e:
+                logg.error("while rm %s: %s", pid_file, e)
+        return done
+    def status_modules(self, *modules):
+        """ [UNIT]... check the status of these units.
+        """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        status, result = self.status_units(units)
+        if not found_all:
+            status = 3 # same as (dead) # original behaviour
+        return (status, result)
+    def status_units(self, units):
+        """ concatenates the status output of all units
+            and the last non-successful statuscode """
+        status, result = 0, ""
+        for unit in units:
+            status1, result1 = self.status_unit(unit)
+            if status1: status = status1
+            if result: result += "\n\n"
+            result += result1
+        return status, result
+    def status_unit(self, unit):
+        conf = self.get_unit_conf(unit)
+        result = "%s - %s" % (unit, self.get_description_from(conf))
+        loaded = conf.loaded()
+        if loaded:
+            filename = conf.filename()
+            enabled = self.enabled_from(conf)
+            result += "\n    Loaded: {loaded} ({filename}, {enabled})".format(**locals())
+            for path in conf.overrides():
+                result += "\n    Drop-In: {path}".format(**locals())
+        else:
+            result += "\n    Loaded: failed"
+            return 3, result
+        active = self.get_active_from(conf)
+        substate = self.get_substate_from(conf)
+        result += "\n    Active: {} ({})".format(active, substate)
+        if active == "active":
+            return 0, result
+        else:
+            return 3, result
+    def cat_modules(self, *modules):
+        """ [UNIT]... show the *.system file for these"
+        """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        done, result = self.cat_units(units)
+        return (done and found_all, result)
+    def cat_units(self, units):
+        done = True
+        result = ""
+        for unit in units:
+            text = self.cat_unit(unit)
+            if not text:
+                done = False
+            else:
+               if result:
+                   result += "\n\n"
+               result += text
+        return done, result
+    def cat_unit(self, unit):
+        try:
+            unit_file = self.unit_file(unit)
+            if unit_file:
+                return open(unit_file).read()
+            logg.error("no file for unit '%s'", unit)
+        except Exception as e:
+            print("Unit {} is not-loaded: {}".format(unit, e))
+        return False
+    ##
+    ##
+    def load_preset_files(self, module = None): # -> [ preset-file-names,... ]
+        """ reads all preset files, returns the scanned files """
+        if self._preset_file_list is None:
+            self._preset_file_list = {}
+            for folder in self.preset_folders():
+                if not folder: 
+                    continue
+                if self._root:
+                    folder = os_path(self._root, folder)
+                if not os.path.isdir(folder):
+                    continue
+                for name in os.listdir(folder):
+                    if not name.endswith(".preset"):
+                        continue
+                    if name not in self._preset_file_list:
+                        path = os.path.join(folder, name)
+                        if os.path.isdir(path):
+                            continue
+                        preset = PresetFile().read(path)
+                        self._preset_file_list[name] = preset
+            logg.debug("found %s preset files", len(self._preset_file_list))
+        return sorted(self._preset_file_list.keys())
+    def get_preset_of_unit(self, unit):
+        """ [UNIT] check the *.preset of this unit
+        """
+        self.load_preset_files()
+        for filename in sorted(self._preset_file_list.keys()):
+            preset = self._preset_file_list[filename]
+            status = preset.get_preset(unit)
+            if status:
+                return status
+        return None
+    def preset_modules(self, *modules):
+        """ [UNIT]... -- set 'enabled' when in *.preset
+        """
+        if self.user_mode():
+            logg.warning("preset makes no sense in --user mode")
+            return True
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.preset_units(units) and found_all
+    def preset_units(self, units):
+        """ fails if any unit could not be changed """
+        self.wait_system()
+        fails = 0
+        found = 0
+        for unit in units:
+            status = self.get_preset_of_unit(unit)
+            if not status: continue
+            found += 1
+            if status.startswith("enable"):
+                if self._preset_mode == "disable": continue
+                logg.info("preset enable %s", unit)
+                if not self.enable_unit(unit):
+                    logg.warning("failed to enable %s", unit)
+                    fails += 1
+            if status.startswith("disable"):
+                if self._preset_mode == "enable": continue
+                logg.info("preset disable %s", unit)
+                if not self.disable_unit(unit):
+                    logg.warning("failed to disable %s", unit)
+                    fails += 1
+        return not fails and not not found
+    def system_preset_all(self, *modules):
+        """ 'preset' all services
+        enable or disable services according to *.preset files
+        """
+        if self.user_mode():
+            logg.warning("preset-all makes no sense in --user mode")
+            return True
+        found_all = True
+        units = self.match_units() # TODO: how to handle module arguments
+        return self.preset_units(units) and found_all
+    def wanted_from(self, conf, default = None):
+        if not conf: return default
+        return conf.get("Install", "WantedBy", default, True)
+    def enablefolders(self, wanted):
+        if self.user_mode():
+            for folder in self.user_folders():
+                 yield self.default_enablefolder(wanted, folder)
+        if True:
+            for folder in self.system_folders():
+                 yield self.default_enablefolder(wanted, folder)
+    def enablefolder(self, wanted = None):
+        if self.user_mode():
+            user_folder = self.user_folder()
+            return self.default_enablefolder(wanted, user_folder)
+        else:
+            return self.default_enablefolder(wanted)
+    def default_enablefolder(self, wanted = None, basefolder = None):
+        basefolder = basefolder or self.system_folder()
+        if not wanted: 
+            return wanted
+        if not wanted.endswith(".wants"):
+            wanted = wanted + ".wants"
+        return os.path.join(basefolder, wanted)
+    def enable_modules(self, *modules):
+        """ [UNIT]... -- enable these units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                logg.info("matched %s", unit) #++
+                if unit not in units:
+                    units += [ unit ]
+        return self.enable_units(units) and found_all
+    def enable_units(self, units):
+        self.wait_system()
+        done = True
+        for unit in units:
+            if not self.enable_unit(unit):
+                done = False
+            elif self._now:
+               self.start_unit(unit)
+        return done
+    def enable_unit(self, unit):
+        unit_file = self.unit_file(unit)
+        if not unit_file:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.is_sysv_file(unit_file):
+            if self.user_mode():
+                logg.error("Initscript %s not for --user mode", unit)
+                return False
+            return self.enable_unit_sysv(unit_file)
+        conf = self.get_unit_conf(unit)
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        wanted = self.wanted_from(self.get_unit_conf(unit))
+        if not wanted: 
+            return False # "static" is-enabled
+        folder = self.enablefolder(wanted)
+        if self._root:
+            folder = os_path(self._root, folder)
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+        target = os.path.join(folder, os.path.basename(unit_file))
+        if True:
+            _f = self._force and "-f" or ""
+            logg.info("ln -s {_f} '{unit_file}' '{target}'".format(**locals()))
+        if self._force and os.path.islink(target):
+            os.remove(target)
+        if not os.path.islink(target):
+            os.symlink(unit_file, target)
+        return True
+    def rc3_root_folder(self):
+        old_folder = "/etc/rc3.d"
+        new_folder = "/etc/init.d/rc3.d"
+        if self._root:
+            old_folder = os_path(self._root, old_folder)
+            new_folder = os_path(self._root, new_folder)
+        if os.path.isdir(old_folder): 
+            return old_folder
+        return new_folder
+    def rc5_root_folder(self):
+        old_folder = "/etc/rc5.d"
+        new_folder = "/etc/init.d/rc5.d"
+        if self._root:
+            old_folder = os_path(self._root, old_folder)
+            new_folder = os_path(self._root, new_folder)
+        if os.path.isdir(old_folder): 
+            return old_folder
+        return new_folder
+    def enable_unit_sysv(self, unit_file):
+        # a "multi-user.target"/rc3 is also started in /rc5
+        rc3 = self._enable_unit_sysv(unit_file, self.rc3_root_folder())
+        rc5 = self._enable_unit_sysv(unit_file, self.rc5_root_folder())
+        return rc3 and rc5
+    def _enable_unit_sysv(self, unit_file, rc_folder):
+        name = os.path.basename(unit_file)
+        nameS = "S50"+name
+        nameK = "K50"+name
+        if not os.path.isdir(rc_folder):
+           os.makedirs(rc_folder)
+        # do not double existing entries
+        for found in os.listdir(rc_folder):
+            m = re.match(r"S\d\d(.*)", found)
+            if m and m.group(1) == name:
+                nameS = found
+            m = re.match(r"K\d\d(.*)", found)
+            if m and m.group(1) == name:
+                nameK = found
+        target = os.path.join(rc_folder, nameS)
+        if not os.path.exists(target):
+            os.symlink(unit_file, target)
+        target = os.path.join(rc_folder, nameK)
+        if not os.path.exists(target):
+            os.symlink(unit_file, target)
+        return True
+    def disable_modules(self, *modules):
+        """ [UNIT]... -- disable these units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.disable_units(units) and found_all
+    def disable_units(self, units):
+        self.wait_system()
+        done = True
+        for unit in units:
+            if not self.disable_unit(unit):
+               done = False
+        return done
+    def disable_unit(self, unit):
+        unit_file = self.unit_file(unit)
+        if not unit_file:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.is_sysv_file(unit_file):
+            if self.user_mode():
+                logg.error("Initscript %s not for --user mode", unit)
+                return False
+            return self.disable_unit_sysv(unit_file)
+        conf = self.get_unit_conf(unit)
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        wanted = self.wanted_from(self.get_unit_conf(unit))
+        if not wanted:
+            return False # "static" is-enabled
+        for folder in self.enablefolders(wanted):
+            if self._root:
+                folder = os_path(self._root, folder)
+            target = os.path.join(folder, os.path.basename(unit_file))
+            if os.path.isfile(target):
+                try:
+                    _f = self._force and "-f" or ""
+                    logg.info("rm {_f} '{target}'".format(**locals()))
+                    os.remove(target)
+                except IOError as e:
+                    logg.error("disable %s: %s", target, e)
+                except OSError as e:
+                    logg.error("disable %s: %s", target, e)
+        return True
+    def disable_unit_sysv(self, unit_file):
+        rc3 = self._disable_unit_sysv(unit_file, self.rc3_root_folder())
+        rc5 = self._disable_unit_sysv(unit_file, self.rc5_root_folder())
+        return rc3 and rc5
+    def _disable_unit_sysv(self, unit_file, rc_folder):
+        # a "multi-user.target"/rc3 is also started in /rc5
+        name = os.path.basename(unit_file)
+        nameS = "S50"+name
+        nameK = "K50"+name
+        # do not forget the existing entries
+        for found in os.listdir(rc_folder):
+            m = re.match(r"S\d\d(.*)", found)
+            if m and m.group(1) == name:
+                nameS = found
+            m = re.match(r"K\d\d(.*)", found)
+            if m and m.group(1) == name:
+                nameK = found
+        target = os.path.join(rc_folder, nameS)
+        if os.path.exists(target):
+           os.unlink(target)
+        target = os.path.join(rc_folder, nameK)
+        if os.path.exists(target):
+           os.unlink(target)
+        return True
+    def is_enabled_sysv(self, unit_file):
+        name = os.path.basename(unit_file)
+        target = os.path.join(self.rc3_root_folder(), "S50%s" % name)
+        if os.path.exists(target):
+           return True
+        return False
+    def is_enabled_modules(self, *modules):
+        """ [UNIT]... -- check if these units are enabled 
+        returns True if any of them is enabled."""
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.is_enabled_units(units) # and found_all
+    def is_enabled_units(self, units):
+        """ true if any is enabled, and a list of infos """
+        result = False
+        infos = []
+        for unit in units:
+            infos += [ self.enabled_unit(unit) ]
+            if self.is_enabled(unit):
+               result = True
+        return result, infos
+    def is_enabled(self, unit):
+        unit_file = self.unit_file(unit)
+        if not unit_file:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.is_sysv_file(unit_file):
+            return self.is_enabled_sysv(unit_file)
+        wanted = self.wanted_from(self.get_unit_conf(unit))
+        if not wanted:
+            return True # "static"
+        for folder in self.enablefolders(wanted):
+            if self._root:
+                folder = os_path(self._root, folder)
+            target = os.path.join(folder, os.path.basename(unit_file))
+            if os.path.isfile(target):
+                return True
+        return False
+    def enabled_unit(self, unit):
+        conf = self.get_unit_conf(unit)
+        return self.enabled_from(conf)
+    def enabled_from(self, conf):
+        unit_file = conf.filename()
+        if self.is_sysv_file(unit_file):
+            state = self.is_enabled_sysv(unit_file)
+            if state: 
+                return "enabled"
+            return "disabled"
+        if conf.masked:
+            return "masked"
+        wanted = self.wanted_from(conf)
+        if not wanted:
+            return "static"
+        for folder in self.enablefolders(wanted):
+            if self._root:
+                folder = os_path(self._root, folder)
+            target = os.path.join(folder, os.path.basename(unit_file))
+            if os.path.isfile(target):
+                return "enabled"
+        return "disabled"
+    def mask_modules(self, *modules):
+        """ [UNIT]... -- mask non-startable units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.mask_units(units) and found_all
+    def mask_units(self, units):
+        self.wait_system()
+        done = True
+        for unit in units:
+            if not self.mask_unit(unit):
+               done = False
+        return done
+    def mask_unit(self, unit):
+        unit_file = self.unit_file(unit)
+        if not unit_file:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.is_sysv_file(unit_file):
+            logg.error("Initscript %s can not be masked", unit)
+            return False
+        conf = self.get_unit_conf(unit)
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        folder = self.mask_folder()
+        if self._root:
+            folder = os_path(self._root, folder)
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+        target = os.path.join(folder, os.path.basename(unit_file))
+        if True:
+            _f = self._force and "-f" or ""
+            logg.debug("ln -s {_f} /dev/null '{target}'".format(**locals()))
+        if self._force and os.path.islink(target):
+            os.remove(target)
+        if not os.path.exists(target):
+            os.symlink("/dev/null", target)
+            logg.info("Created symlink {target} -> /dev/null".format(**locals()))
+            return True
+        elif os.path.islink(target):
+            logg.debug("mask symlink does already exist: %s", target)
+            return True
+        else:
+            logg.error("mask target does already exist: %s", target)
+            return False
+    def mask_folder(self):
+        for folder in self.mask_folders():
+            if folder: return folder
+        raise Exception("did not find any systemd/system folder")
+    def mask_folders(self):
+        if self.user_mode():
+            for folder in self.user_folders():
+                 yield folder
+        if True:
+            for folder in self.system_folders():
+                 yield folder
+    def unmask_modules(self, *modules):
+        """ [UNIT]... -- unmask non-startable units """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.unmask_units(units) and found_all
+    def unmask_units(self, units):
+        self.wait_system()
+        done = True
+        for unit in units:
+            if not self.unmask_unit(unit):
+               done = False
+        return done
+    def unmask_unit(self, unit):
+        unit_file = self.unit_file(unit)
+        if not unit_file:
+            logg.error("Unit %s could not be found.", unit)
+            return False
+        if self.is_sysv_file(unit_file):
+            logg.error("Initscript %s can not be un/masked", unit)
+            return False
+        conf = self.get_unit_conf(unit)
+        if self.not_user_conf(conf):
+            logg.error("Unit %s not for --user mode", unit)
+            return False
+        folder = self.mask_folder()
+        if self._root:
+            folder = os_path(self._root, folder)
+        target = os.path.join(folder, os.path.basename(unit_file))
+        if True:
+            _f = self._force and "-f" or ""
+            logg.info("rm {_f} '{target}'".format(**locals()))
+        if os.path.islink(target):
+            os.remove(target)
+            return True
+        elif not os.path.exists(target):
+            logg.debug("Symlink did exist anymore: %s", target)
+            return True
+        else:
+            logg.warning("target is not a symlink: %s", target)
+            return True
+    def list_dependencies_modules(self, *modules):
+        """ [UNIT]... show the dependency tree"
+        """
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.list_dependencies_units(units) # and found_all
+    def list_dependencies_units(self, units):
+        if self._now:
+            return self.list_start_dependencies_units(units)
+        result = []
+        for unit in units:
+            if result:
+                result += [ "", "" ]
+            result += self.list_dependencies_unit(unit)
+        return result
+    def list_dependencies_unit(self, unit):
+        result = []
+        for line in self.list_dependencies(unit, ""):
+            result += [ line ]
+        return result
+    def list_dependencies(self, unit, indent = None, mark = None, loop = []):
+        mapping = {}
+        mapping["Requires"] = "required to start"
+        mapping["Wants"] = "wanted to start"
+        mapping["Requisite"] = "required started"
+        mapping["Bindsto"] = "binds to start"
+        mapping["PartOf"] = "part of started"
+        mapping[".requires"] = ".required to start"
+        mapping[".wants"] = ".wanted to start"
+        mapping["PropagateReloadTo"] = "(to be reloaded as well)"
+        mapping["Conflicts"] = "(to be stopped on conflict)"
+        restrict = ["Requires", "Requisite", "ConsistsOf", "Wants", 
+            "BindsTo", ".requires", ".wants"]
+        indent = indent or ""
+        mark = mark or ""
+        deps = self.get_dependencies_unit(unit)
+        conf = self.get_unit_conf(unit)
+        if not conf.loaded():
+            if not self._show_all:
+                return
+            yield "%s(%s): %s" % (indent, unit, mark)
+        else:
+            yield "%s%s: %s" % (indent, unit, mark)
+            for stop_recursion in [ "Conflict", "conflict", "reloaded", "Propagate" ]:
+                if stop_recursion in mark:
+                    return
+            for dep in deps:
+                if dep in loop:
+                    logg.debug("detected loop at %s", dep)
+                    continue
+                new_loop = loop + list(deps.keys())
+                new_indent = indent + "| "
+                new_mark = deps[dep]
+                if not self._show_all:
+                    if new_mark not in restrict:
+                        continue
+                if new_mark in mapping:
+                    new_mark = mapping[new_mark]
+                restrict = ["Requires", "Requisite", "ConsistsOf", "Wants", 
+                    "BindsTo", ".requires", ".wants"]
+                for line in self.list_dependencies(dep, new_indent, new_mark, new_loop):
+                    yield line
+    def get_dependencies_unit(self, unit):
+        conf = self.get_unit_conf(unit)
+        deps = {}
+        for style in [ "Requires", "Wants", "Requisite", "BindsTo", "PartOf",
+            ".requires", ".wants", "PropagateReloadTo", "Conflicts",  ]:
+            if style.startswith("."):
+                for folder in self.sysd_folders():
+                    if not folder: 
+                        continue
+                    require_path = os.path.join(folder, unit + style)
+                    if self._root:
+                        require_path = os_path(self._root, require_path)
+                    if os.path.isdir(require_path):
+                        for required in os.listdir(require_path):
+                            if required not in deps:
+                                deps[required] = style
+            else:
+                for requirelist in conf.getlist("Unit", style, []):
+                    for required in requirelist.strip().split(" "):
+                        deps[required.strip()] = style
+        return deps
+    def get_start_dependencies(self, unit): # pragma: no cover
+        """ the list of services to be started as well / TODO: unused """
+        deps = {}
+        unit_deps = self.get_dependencies_unit(unit)
+        for dep_unit, dep_style in unit_deps.items():
+            restrict = ["Requires", "Requisite", "ConsistsOf", "Wants", 
+                "BindsTo", ".requires", ".wants"]
+            if dep_style in restrict:
+                if dep_unit in deps:
+                    if dep_style not in deps[dep_unit]:
+                        deps[dep_unit].append( dep_style)
+                else:
+                    deps[dep_unit] = [ dep_style ]
+                next_deps = self.get_start_dependencies(dep_unit)
+                for dep, styles in next_deps.items():
+                    for style in styles:
+                        if dep in deps:
+                            if style not in deps[dep]:
+                                deps[dep].append(style)
+                        else:
+                            deps[dep] = [ style ]
+        return deps
+    def list_start_dependencies_units(self, units):
+        unit_order = []
+        deps = {}
+        for unit in units:
+            unit_order.append(unit)
+            # unit_deps = self.get_start_dependencies(unit) # TODO
+            unit_deps = self.get_dependencies_unit(unit)
+            for dep_unit, styles in unit_deps.items():
+                styles = to_list(styles)
+                for dep_style in styles:
+                    if dep_unit in deps:
+                        if dep_style not in deps[dep_unit]:
+                            deps[dep_unit].append( dep_style)
+                    else:
+                        deps[dep_unit] = [ dep_style ]
+        deps_conf = []
+        for dep in deps:
+            if dep in unit_order:
+                continue
+            conf = self.get_unit_conf(dep)
+            if conf.loaded():
+                deps_conf.append(conf)
+        for unit in unit_order:
+            deps[unit] = [ "Requested" ]
+            conf = self.get_unit_conf(unit)
+            if conf.loaded():
+                deps_conf.append(conf)
+        result = []
+        for dep in sortedAfter(deps_conf, cmp=compareAfter):
+            line = (dep.name(),  "(%s)" % (" ".join(deps[dep.name()])))
+            result.append(line)
+        return result
+    def sortedAfter(self, unitlist):
+        """ get correct start order for the unit list (ignoring masked units) """
+        conflist = [ self.get_unit_conf(unit) for unit in unitlist ]
+        if True:
+            conflist = []
+            for unit in unitlist:
+                conf = self.get_unit_conf(unit)
+                if conf.masked:
+                    logg.debug("ignoring masked unit %s", unit)
+                    continue
+                conflist.append(conf)
+        sortlist = sortedAfter(conflist)
+        return [ item.name() for item in sortlist ]
+    def sortedBefore(self, unitlist):
+        """ get correct start order for the unit list (ignoring masked units) """
+        conflist = [ self.get_unit_conf(unit) for unit in unitlist ]
+        if True:
+            conflist = []
+            for unit in unitlist:
+                conf = self.get_unit_conf(unit)
+                if conf.masked:
+                    logg.debug("ignoring masked unit %s", unit)
+                    continue
+                conflist.append(conf)
+        sortlist = sortedAfter(reversed(conflist))
+        return [ item.name() for item in reversed(sortlist) ]
+    def system_daemon_reload(self):
+        """ reload does will only check the service files here.
+            The returncode will tell the number of warnings,
+            and it is over 100 if it can not continue even
+            for the relaxed systemctl.py style of execution. """
+        errors = 0
+        for unit in self.match_units():
+            try:
+                conf = self.get_unit_conf(unit)
+            except Exception as e:
+                logg.error("%s: can not read unit file %s\n\t%s", 
+                    unit, conf.filename(), e)
+                continue
+            errors += self.syntax_check(conf)
+        if errors:
+            logg.warning(" (%s) found %s problems", errors, errors % 100)
+        return True # errors
+    def syntax_check(self, conf):
+        if conf.filename() and conf.filename().endswith(".service"):
+            return self.syntax_check_service(conf)
+        return 0
+    def syntax_check_service(self, conf):
+        unit = conf.name()
+        if not conf.data.has_section("Service"):
+           logg.error(" %s: a .service file without [Service] section", unit)
+           return 101
+        errors = 0
+        haveType = conf.get("Service", "Type", "simple")
+        haveExecStart = conf.getlist("Service", "ExecStart", [])
+        haveExecStop = conf.getlist("Service", "ExecStop", [])
+        haveExecReload = conf.getlist("Service", "ExecReload", [])
+        usedExecStart = []
+        usedExecStop = []
+        usedExecReload = []
+        if haveType not in [ "simple", "forking", "notify", "oneshot", "dbus", "idle", "sysv"]:
+            logg.error(" %s: Failed to parse service type, ignoring: %s", unit, haveType)
+            errors += 100
+        for line in haveExecStart:
+            if not line.startswith("/") and not line.startswith("-/"):
+                logg.error(" %s: Executable path is not absolute, ignoring: %s", unit, line.strip())
+                errors += 1
+            usedExecStart.append(line)
+        for line in haveExecStop:
+            if not line.startswith("/") and not line.startswith("-/"):
+                logg.error(" %s: Executable path is not absolute, ignoring: %s", unit, line.strip())
+                errors += 1
+            usedExecStop.append(line)
+        for line in haveExecReload:
+            if not line.startswith("/") and not line.startswith("-/"):
+                logg.error(" %s: Executable path is not absolute, ignoring: %s", unit, line.strip())
+                errors += 1
+            usedExecReload.append(line)
+        if haveType in ["simple", "notify", "forking", "idle"]:
+            if not usedExecStart and not usedExecStop:
+                logg.error(" %s: Service lacks both ExecStart and ExecStop= setting. Refusing.", unit)
+                errors += 101
+            elif not usedExecStart and haveType != "oneshot":
+                logg.error(" %s: Service has no ExecStart= setting, which is only allowed for Type=oneshot services. Refusing.",  unit)
+                errors += 101
+        if len(usedExecStart) > 1 and haveType != "oneshot":
+            logg.error(" %s: there may be only one ExecStart statement (unless for 'oneshot' services)."
+              + "\n\t\t\tYou can use ExecStartPre / ExecStartPost to add additional commands.", unit)
+            errors += 1
+        if len(usedExecStop) > 1 and haveType != "oneshot":
+            logg.info(" %s: there should be only one ExecStop statement (unless for 'oneshot' services)."
+              + "\n\t\t\tYou can use ExecStopPost to add additional commands (also executed on failed Start)", unit)
+        if len(usedExecReload) > 1:
+            logg.info(" %s: there should be only one ExecReload statement."
+              + "\n\t\t\tUse ' ; ' for multiple commands (ExecReloadPost or ExedReloadPre do not exist)", unit)
+        if len(usedExecReload) > 0 and "/bin/kill " in usedExecReload[0]:
+            logg.warning(" %s: the use of /bin/kill is not recommended for ExecReload as it is asychronous."
+              + "\n\t\t\tThat means all the dependencies will perform the reload simultanously / out of order.", unit)
+        if conf.getlist("Service", "ExecRestart", []): #pragma: no cover
+            logg.error(" %s: there no such thing as an ExecRestart (ignored)", unit)
+        if conf.getlist("Service", "ExecRestartPre", []): #pragma: no cover
+            logg.error(" %s: there no such thing as an ExecRestartPre (ignored)", unit)
+        if conf.getlist("Service", "ExecRestartPost", []): #pragma: no cover 
+            logg.error(" %s: there no such thing as an ExecRestartPost (ignored)", unit)
+        if conf.getlist("Service", "ExecReloadPre", []): #pragma: no cover
+            logg.error(" %s: there no such thing as an ExecReloadPre (ignored)", unit)
+        if conf.getlist("Service", "ExecReloadPost", []): #pragma: no cover
+            logg.error(" %s: there no such thing as an ExecReloadPost (ignored)", unit)
+        if conf.getlist("Service", "ExecStopPre", []): #pragma: no cover
+            logg.error(" %s: there no such thing as an ExecStopPre (ignored)", unit)
+        for env_file in conf.getlist("Service", "EnvironmentFile", []):
+            if env_file.startswith("-"): continue
+            if not os.path.isfile(os_path(self._root, env_file)):
+                logg.error(" %s: Failed to load environment files: %s", unit, env_file)
+                errors += 101
+        return errors
+    def exec_check_service(self, conf, env, exectype = ""):
+        if not conf:
+            return True
+        if not conf.data.has_section("Service"):
+            return True #pragma: no cover
+        haveType = conf.get("Service", "Type", "simple")
+        if haveType in [ "sysv" ]:
+            return True # we don't care about that
+        abspath = 0
+        notexists = 0
+        for execs in [ "ExecStartPre", "ExecStart", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecReload" ]:
+            if not execs.startswith(exectype):
+                continue
+            for cmd in conf.getlist("Service", execs, []):
+                check, cmd = checkstatus(cmd)
+                newcmd = self.exec_cmd(cmd, env, conf)
+                if not newcmd:
+                    continue
+                exe = newcmd[0]
+                if not exe:
+                    continue
+                if exe[0] != "/":
+                    logg.error(" Exec is not an absolute path:  %s=%s", execs, cmd)
+                    abspath += 1
+                if not os.path.isfile(exe):
+                    logg.error(" Exec command does not exist: (%s) %s", execs, exe)
+                    notexists += 1
+                    newexe1 = os.path.join("/usr/bin", exe)
+                    newexe2 = os.path.join("/bin", exe)
+                    if os.path.exists(newexe1):
+                        logg.error(" but this does exist: %s  %s", " " * len(execs), newexe1)
+                    elif os.path.exists(newexe2):
+                        logg.error(" but this does exist: %s      %s", " " * len(execs), newexe2)
+        if not abspath and not notexists:
+            return True
+        if True:
+            filename = conf.filename()
+            if len(filename) > 45: filename = "..." + filename[-42:]
+            logg.error(" !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            logg.error(" Found %s problems in %s", abspath + notexists, filename)
+            time.sleep(1)
+            if abspath:
+                logg.error(" The SystemD commands must always be absolute paths by definition.")
+                time.sleep(1)
+                logg.error(" Earlier versions of systemctl.py did use a subshell thus using $PATH")
+                time.sleep(1)
+                logg.error(" however newer versions use execve just like the real SystemD daemon")
+                time.sleep(1)
+                logg.error(" so that your docker-only service scripts may start to fail suddenly.")
+                time.sleep(1)
+            if notexists:
+                logg.error(" Now %s executable paths were not found in the current environment.", notexists)
+                time.sleep(1)
+            logg.error(" !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        return False
+    def show_modules(self, *modules):
+        """ [PATTERN]... -- Show properties of one or more units
+           Show properties of one or more units (or the manager itself).
+           If no argument is specified, properties of the manager will be
+           shown. If a unit name is specified, properties of the unit is
+           shown. By default, empty properties are suppressed. Use --all to
+           show those too. To select specific properties to show, use
+           --property=. This command is intended to be used whenever
+           computer-parsable output is required. Use status if you are looking
+           for formatted human-readable output.
+  
+           NOTE: only a subset of properties is implemented """
+        notfound = []
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                units += [ module ]
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        return self.show_units(units) + notfound # and found_all
+    def show_units(self, units):
+        logg.debug("show --property=%s", self._unit_property)
+        result = []
+        for unit in units:
+            if result: result += [ "" ]
+            for var, value in self.show_unit_items(unit):
+                if self._unit_property:
+                    if self._unit_property != var:
+                        continue
+                else:
+                    if not value and not self._show_all:
+                        continue
+                result += [ "%s=%s" % (var, value) ]
+        return result
+    def show_unit_items(self, unit):
+        """ [UNIT]... -- show properties of a unit.
+        """
+        logg.info("try read unit %s", unit)
+        conf = self.get_unit_conf(unit)
+        for entry in self.each_unit_items(unit, conf):
+            yield entry
+    def each_unit_items(self, unit, conf):
+        loaded = conf.loaded()
+        if not loaded:
+            loaded = "not-loaded"
+            if "NOT-FOUND" in self.get_description_from(conf):
+                loaded = "not-found"
+        yield "Id", unit
+        yield "Names", unit
+        yield "Description", self.get_description_from(conf) # conf.get("Unit", "Description")
+        yield "PIDFile", self.pid_file_from(conf) # not self.pid_file_from w/o default location
+        yield "MainPID", self.active_pid_from(conf) or "0"  # status["MainPID"] or PIDFile-read
+        yield "SubState", self.get_substate_from(conf)      # status["SubState"] or notify-result
+        yield "ActiveState", self.get_active_from(conf)     # status["ActiveState"]
+        yield "LoadState", loaded
+        yield "UnitFileState", self.enabled_from(conf)
+        yield "User", self.get_User(conf) or ""
+        yield "Group", self.get_Group(conf) or ""
+        yield "SupplementaryGroups", " ".join(self.get_SupplementaryGroups(conf))
+        yield "TimeoutStartUSec", seconds_to_time(self.get_TimeoutStartSec(conf))
+        yield "TimeoutStopUSec", seconds_to_time(self.get_TimeoutStopSec(conf))
+        yield "NeedDaemonReload", "no"
+        env_parts = []
+        for env_part in conf.getlist("Service", "Environment", []):
+            env_parts.append(self.expand_special(env_part, conf))
+        if env_parts: 
+            yield "Environment", " ".join(env_parts)
+        env_files = []
+        for env_file in conf.getlist("Service", "EnvironmentFile", []):
+            env_files.append(self.expand_special(env_file, conf))
+        if env_files:
+            yield "EnvironmentFile", " ".join(env_files)
+    #
+    igno_centos = [ "netconsole", "network" ]
+    igno_opensuse = [ "raw", "pppoe", "*.local", "boot.*", "rpmconf*", "purge-kernels.service", "after-local.service", "postfix*" ]
+    igno_ubuntu = [ "mount*", "umount*", "ondemand", "*.local" ]
+    igno_always = [ "network*", "dbus", "systemd-*" ]
+    def _ignored_unit(self, unit, ignore_list):
+        for ignore in ignore_list:
+            if fnmatch.fnmatchcase(unit, ignore):
+                return True # ignore
+            if fnmatch.fnmatchcase(unit, ignore+".service"):
+                return True # ignore
+        return False
+    def system_default_services(self, sysv = "S", default_target = None):
+        """ show the default services 
+            This is used internally to know the list of service to be started in 'default'
+            runlevel when the container is started through default initialisation. It will
+            ignore a number of services - use '--all' to show a longer list of services and
+            use '--all --force' if not even a minimal filter shall be used.
+        """
+        igno = self.igno_centos + self.igno_opensuse + self.igno_ubuntu + self.igno_always
+        if self._show_all:
+            igno = self.igno_always
+            if self._force:
+                igno = []
+        logg.debug("ignored services filter for default.target:\n\t%s", igno)
+        return self.enabled_default_services(sysv, default_target, igno)
+    def enabled_default_services(self, sysv = "S", default_target = None, igno = []):
+        if self.user_mode():
+            return self.enabled_default_user_services(sysv, default_target, igno)
+        else:
+            return self.enabled_default_system_services(sysv, default_target, igno)
+    def enabled_default_user_services(self, sysv = "S", default_target = None, igno = []):
+        logg.debug("check for default user services")
+        default_target = default_target or self._default_target
+        default_services = []
+        for basefolder in self.user_folders():
+            if not basefolder:
+                continue
+            folder = self.default_enablefolder(default_target, basefolder)
+            if self._root:
+                folder = os_path(self._root, folder)
+            if os.path.isdir(folder):
+                for unit in sorted(os.listdir(folder)):
+                    path = os.path.join(folder, unit)
+                    if os.path.isdir(path): continue
+                    if self._ignored_unit(unit, igno):
+                        continue # ignore
+                    if unit.endswith(".service"):
+                        default_services.append(unit)
+        for basefolder in self.system_folders():
+            if not basefolder:
+                continue
+            folder = self.default_enablefolder(default_target, basefolder)
+            if self._root:
+                folder = os_path(self._root, folder)
+            if os.path.isdir(folder):
+                for unit in sorted(os.listdir(folder)):
+                    path = os.path.join(folder, unit)
+                    if os.path.isdir(path): continue
+                    if self._ignored_unit(unit, igno):
+                        continue # ignore
+                    if unit.endswith(".service"):
+                        conf = self.load_unit_conf(unit)
+                        if self.not_user_conf(conf):
+                            pass 
+                        else:
+                            default_services.append(unit)
+        return default_services
+    def enabled_default_system_services(self, sysv = "S", default_target = None, igno = []):
+        logg.debug("check for default system services")
+        default_target = default_target or self._default_target
+        default_services = []
+        for basefolder in self.system_folders():
+            if not basefolder:
+                continue
+            folder = self.default_enablefolder(default_target, basefolder)
+            if self._root:
+                folder = os_path(self._root, folder)
+            if os.path.isdir(folder):
+                for unit in sorted(os.listdir(folder)):
+                    path = os.path.join(folder, unit)
+                    if os.path.isdir(path): continue
+                    if self._ignored_unit(unit, igno):
+                        continue # ignore
+                    if unit.endswith(".service"):
+                        default_services.append(unit)
+        for folder in [ self.rc3_root_folder() ]:
+            if not os.path.isdir(folder):
+                logg.warning("non-existant %s", folder)
+                continue
+            for unit in sorted(os.listdir(folder)):
+                path = os.path.join(folder, unit)
+                if os.path.isdir(path): continue
+                m = re.match(sysv+r"\d\d(.*)", unit)
+                if m:
+                    service = m.group(1)
+                    unit = service + ".service"
+                    if self._ignored_unit(unit, igno):
+                        continue # ignore
+                    default_services.append(unit)
+        return default_services
+    def system_default(self, arg = True):
+        """ start units for default system level
+            This will go through the enabled services in the default 'multi-user.target'.
+            However some services are ignored as being known to be installation garbage
+            from unintended services. Use '--all' so start all of the installed services
+            and with '--all --force' even those services that are otherwise wrong. 
+            /// SPECIAL: with --now or --init the init-loop is run and afterwards
+                a system_halt is performed with the enabled services to be stopped."""
+        self.sysinit_status(SubState = "initializing")
+        logg.info("system default requested - %s", arg)
+        init = self._now or self._init
+        self.start_system_default(init = init)
+    def start_system_default(self, init = False):
+        """ detect the default.target services and start them.
+            When --init is given then the init-loop is run and
+            the services are stopped again by 'systemctl halt'."""
+        default_target = self._default_target
+        default_services = self.system_default_services("S", default_target)
+        self.sysinit_status(SubState = "starting")
+        self.start_units(default_services)
+        logg.info(" -- system is up")
+        if init:
+            logg.info("init-loop start")
+            sig = self.init_loop_until_stop(default_services)
+            logg.info("init-loop %s", sig)
+            self.stop_system_default()
+    def stop_system_default(self):
+        """ detect the default.target services and stop them.
+            This is commonly run through 'systemctl halt' or
+            at the end of a 'systemctl --init default' loop."""
+        default_target = self._default_target
+        default_services = self.system_default_services("K", default_target)
+        self.sysinit_status(SubState = "stopping")
+        self.stop_units(default_services)
+        logg.info(" -- system is down")
+    def system_halt(self, arg = True):
+        """ stop units from default system level """
+        logg.info("system halt requested - %s", arg)
+        self.stop_system_default()
+        try: 
+            os.kill(1, signal.SIGQUIT) # exit init-loop on no_more_procs
+        except Exception as e:
+            logg.warning("SIGQUIT to init-loop on PID-1: %s", e)
+    def system_get_default(self):
+        """ get current default run-level"""
+        current = self._default_target
+        folder = os_path(self._root, self.mask_folder())
+        target = os.path.join(folder, "default.target")
+        if os.path.islink(target):
+            current = os.path.basename(os.readlink(target))
+        return current
+    def set_default_modules(self, *modules):
+        """ set current default run-level"""
+        if not modules:
+            logg.debug(".. no runlevel given")
+            return (1, "Too few arguments")
+        current = self._default_target
+        folder = os_path(self._root, self.mask_folder())
+        target = os.path.join(folder, "default.target")
+        if os.path.islink(target):
+            current = os.path.basename(os.readlink(target))
+        err, msg = 0, ""
+        for module in modules:
+            if module == current:
+                continue
+            targetfile = None
+            for targetname, targetpath in self.each_target_file():
+                if targetname == module:
+                    targetfile = targetpath
+            if not targetfile:
+                err, msg = 3, "No such runlevel %s" % (module)
+                continue
+            #
+            if os.path.islink(target):
+                os.unlink(target)
+            if not os.path.isdir(os.path.dirname(target)):
+                os.makedirs(os.path.dirname(target))
+            os.symlink(targetfile, target)
+            msg = "Created symlink from %s -> %s" % (target, targetfile)
+            logg.debug("%s", msg)
+        return (err, msg)
+    def init_modules(self, *modules):
+        """ [UNIT*] -- init loop: '--init default' or '--init start UNIT*'
+        The systemctl init service will start the enabled 'default' services, 
+        and then wait for any  zombies to be reaped. When a SIGINT is received
+        then a clean shutdown of the enabled services is ensured. A Control-C in
+        in interactive mode will also run 'stop' on all the enabled services. //
+        When a UNIT name is given then only that one is started instead of the
+        services in the 'default.target'. Using 'init UNIT' is better than 
+        '--init start UNIT' because the UNIT is also stopped cleanly even when 
+        it was never enabled in the system.
+        /// SPECIAL: when using --now then only the init-loop is started, 
+        with the reap-zombies function and waiting for an interrupt.
+        (and no unit is started/stoppped wether given or not).
+        """
+        if self._now:
+            return self.init_loop_until_stop([])
+        if not modules:
+            # like 'systemctl --init default'
+            if self._now or self._show_all:
+                logg.debug("init default --now --all => no_more_procs")
+                self.exit_when_no_more_procs = True
+            return self.start_system_default(init = True)
+        #
+        # otherwise quit when all the init-services have died
+        self.exit_when_no_more_services = True
+        if self._now or self._show_all:
+            logg.debug("init services --now --all => no_more_procs")
+            self.exit_when_no_more_procs = True
+        found_all = True
+        units = []
+        for module in modules:
+            matched = self.match_units([ module ])
+            if not matched:
+                logg.error("Unit %s could not be found.", unit_of(module))
+                found_all = False
+                continue
+            for unit in matched:
+                if unit not in units:
+                    units += [ unit ]
+        logg.info("init %s -> start %s", ",".join(modules), ",".join(units))
+        done = self.start_units(units, init = True) 
+        logg.info("-- init is done")
+        return done # and found_all
+    def start_log_files(self, units):
+        self._log_file = {}
+        self._log_hold = {}
+        for unit in units:
+            conf = self.load_unit_conf(unit)
+            if not conf: continue
+            log_path = self.path_journal_log(conf)
+            try:
+                opened = os.open(log_path, os.O_RDONLY | os.O_NONBLOCK)
+                self._log_file[unit] = opened
+                self._log_hold[unit] = b""
+            except Exception as e:
+                logg.error("can not open %s log: %s\n\t%s", unit, log_path, e)
+    def read_log_files(self, units):
+        BUFSIZE=8192
+        for unit in units:
+            if unit in self._log_file:
+                new_text = b""
+                while True:
+                    buf = os.read(self._log_file[unit], BUFSIZE)
+                    if not buf: break
+                    new_text += buf
+                    continue
+                text = self._log_hold[unit] + new_text
+                if not text: continue
+                lines = text.split(b"\n")
+                if not text.endswith(b"\n"):
+                    self._log_hold[unit] = lines[-1]
+                    lines = lines[:-1]
+                for line in lines:
+                    prefix = unit.encode("utf-8")
+                    content = prefix+b": "+line+b"\n"
+                    os.write(1, content)
+                    try: os.fsync(1)
+                    except: pass
+    def stop_log_files(self, units):
+        for unit in units:
+            try:
+                if unit in self._log_file:
+                    if self._log_file[unit]:
+                        os.close(self._log_file[unit])
+            except Exception as e:
+                logg.error("can not close log: %s\n\t%s", unit, e)
+        self._log_file = {}
+        self._log_hold = {}
+    def init_loop_until_stop(self, units):
+        """ this is the init-loop - it checks for any zombies to be reaped and
+            waits for an interrupt. When a SIGTERM /SIGINT /Control-C signal
+            is received then the signal name is returned. Any other signal will 
+            just raise an Exception like one would normally expect. As a special
+            the 'systemctl halt' emits SIGQUIT which puts it into no_more_procs mode."""
+        signal.signal(signal.SIGQUIT, lambda signum, frame: ignore_signals_and_raise_keyboard_interrupt("SIGQUIT"))
+        signal.signal(signal.SIGINT, lambda signum, frame: ignore_signals_and_raise_keyboard_interrupt("SIGINT"))
+        signal.signal(signal.SIGTERM, lambda signum, frame: ignore_signals_and_raise_keyboard_interrupt("SIGTERM"))
+        self.start_log_files(units)
+        self.sysinit_status(ActiveState = "active", SubState = "running")
+        result = None
+        while True:
+            try:
+                time.sleep(InitLoopSleep)
+                self.read_log_files(units)
+                ##### the reaper goes round
+                running = self.system_reap_zombies()
+                # logg.debug("reap zombies - init-loop found %s running procs", running)
+                if self.exit_when_no_more_services:
+                    active = False
+                    for unit in units:
+                        conf = self.load_unit_conf(unit)
+                        if not conf: continue
+                        if self.is_active_from(conf):
+                            active = True
+                    if not active:
+                        logg.info("no more services - exit init-loop")
+                        break
+                if self.exit_when_no_more_procs:
+                    if not running:
+                        logg.info("no more procs - exit init-loop")
+                        break
+            except KeyboardInterrupt as e:
+                if e.args and e.args[0] == "SIGQUIT":
+                    # the original systemd puts a coredump on that signal.
+                    logg.info("SIGQUIT - switch to no more procs check")
+                    self.exit_when_no_more_procs = True
+                    continue
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                logg.info("interrupted - exit init-loop")
+                result = e.message or "STOPPED"
+                break
+            except Exception as e:
+                logg.info("interrupted - exception %s", e)
+                raise
+        self.sysinit_status(ActiveState = None, SubState = "degraded")
+        self.read_log_files(units)
+        self.read_log_files(units)
+        self.stop_log_files(units)
+        logg.debug("done - init loop")
+        return result
+    def system_reap_zombies(self):
+        """ check to reap children """
+        selfpid = os.getpid()
+        running = 0
+        for pid in os.listdir("/proc"):
+            try: pid = int(pid)
+            except: continue
+            if pid == selfpid:
+                continue
+            proc_status = "/proc/%s/status" % pid
+            if os.path.isfile(proc_status):
+                zombie = False
+                ppid = -1
+                try:
+                    for line in open(proc_status):
+                        m = re.match(r"State:\s*Z.*", line)
+                        if m: zombie = True
+                        m = re.match(r"PPid:\s*(\d+)", line)
+                        if m: ppid = int(m.group(1))
+                except IOError as e:
+                    logg.warning("%s : %s", proc_status, e)
+                    continue
+                if zombie and ppid == os.getpid():
+                    logg.info("reap zombie %s", pid)
+                    try: os.waitpid(pid, os.WNOHANG)
+                    except OSError as e: 
+                        logg.warning("reap zombie %s: %s", e.strerror)
+            if os.path.isfile(proc_status):
+                if pid > 1:
+                    running += 1
+        return running # except PID 0 and PID 1
+    def sysinit_status(self, **status):
+        conf = self.sysinit_target()
+        self.write_status_from(conf, **status)
+    def sysinit_target(self):
+        if not self._sysinit_target:
+            self._sysinit_target = self.default_unit_conf("sysinit.target", "System Initialization")
+        return self._sysinit_target
+    def is_system_running(self):
+        conf = self.sysinit_target()
+        status_file = self.status_file_from(conf)
+        if not os.path.isfile(status_file):
+            time.sleep(EpsilonTime)
+        if not os.path.isfile(status_file):
+            return "offline"
+        status = self.read_status_from(conf)
+        return status.get("SubState", "unknown")
+    def system_is_system_running(self):
+        state = self.is_system_running()
+        if self._quiet:
+            return state in [ "running" ]
+        else:
+            if state in [ "running" ]:
+                return True, state
+            else:
+                return False, state
+    def wait_system(self, target = None):
+        target = target or SysInitTarget
+        for attempt in xrange(int(SysInitWait)):
+            state = self.is_system_running()
+            if "init" in state:
+                if target in [ "sysinit.target", "basic.target" ]:
+                    logg.info("system not initialized - wait %s", target)
+                    time.sleep(1)
+                    continue
+            if "start" in state or "stop" in state:
+                if target in [ "basic.target" ]:
+                    logg.info("system not running - wait %s", target)
+                    time.sleep(1)
+                    continue
+            if "running" not in state:
+                logg.info("system is %s", state)
+            break
+    def pidlist_of(self, pid):
+        try: pid = int(pid)
+        except: return []
+        pidlist = [ pid ]
+        pids = [ pid ]
+        for depth in xrange(ProcMaxDepth):
+            for pid in os.listdir("/proc"):
+                try: pid = int(pid)
+                except: continue
+                proc_status = "/proc/%s/status" % pid
+                if os.path.isfile(proc_status):
+                    try:
+                        for line in open(proc_status):
+                            if line.startswith("PPid:"):
+                                ppid = line[len("PPid:"):].strip()
+                                try: ppid = int(ppid)
+                                except: continue
+                                if ppid in pidlist and pid not in pids:
+                                    pids += [ pid ]
+                    except IOError as e:
+                        logg.warning("%s : %s", proc_status, e)
+                        continue
+            if len(pids) != len(pidlist):
+                pidlist = pids[:]
+                continue
+        return pids
+    def etc_hosts(self):
+        path = "/etc/hosts"
+        if self._root:
+            return os_path(self._root, path)
+        return path
+    def force_ipv4(self, *args):
+        """ only ipv4 localhost in /etc/hosts """
+        logg.debug("checking /etc/hosts for '::1 localhost'")
+        lines = []
+        for line in open(self.etc_hosts()):
+            if "::1" in line:
+                newline = re.sub("\\slocalhost\\s", " ", line)
+                if line != newline:
+                    logg.info("/etc/hosts: '%s' => '%s'", line.rstrip(), newline.rstrip())
+                    line = newline
+            lines.append(line)
+        f = open(self.etc_hosts(), "w")
+        for line in lines:
+            f.write(line)
+        f.close()
+    def force_ipv6(self, *args):
+        """ only ipv4 localhost in /etc/hosts """
+        logg.debug("checking /etc/hosts for '127.0.0.1 localhost'")
+        lines = []
+        for line in open(self.etc_hosts()):
+            if "127.0.0.1" in line:
+                newline = re.sub("\\slocalhost\\s", " ", line)
+                if line != newline:
+                    logg.info("/etc/hosts: '%s' => '%s'", line.rstrip(), newline.rstrip())
+                    line = newline
+            lines.append(line)
+        f = open(self.etc_hosts(), "w")
+        for line in lines:
+            f.write(line)
+        f.close()
+    def show_help(self, *args):
+        """[command] -- show this help
+        """
+        lines = []
+        okay = True
+        prog = os.path.basename(sys.argv[0])
+        if not args:
+            argz = {}
+            for name in dir(self):
+                arg = None
+                if name.startswith("system_"):
+                   arg = name[len("system_"):].replace("_","-")
+                if name.startswith("show_"):
+                   arg = name[len("show_"):].replace("_","-")
+                if name.endswith("_of_unit"):
+                   arg = name[:-len("_of_unit")].replace("_","-")
+                if name.endswith("_modules"):
+                   arg = name[:-len("_modules")].replace("_","-")
+                if arg:
+                   argz[arg] = name
+            lines.append("%s command [options]..." % prog)
+            lines.append("")
+            lines.append("Commands:")
+            for arg in sorted(argz):
+                name = argz[arg]
+                method = getattr(self, name)
+                doc = "..."
+                doctext = getattr(method, "__doc__")
+                if doctext:
+                    doc = doctext
+                elif not self._show_all:
+                    continue # pragma: nocover
+                firstline = doc.split("\n")[0]
+                doc_text = firstline.strip()
+                if "--" not in firstline:
+                    doc_text = "-- " + doc_text
+                lines.append(" %s %s" % (arg, firstline.strip()))
+            return lines
+        for arg in args:
+            arg = arg.replace("-","_")
+            func1 = getattr(self.__class__, arg+"_modules", None)
+            func2 = getattr(self.__class__, arg+"_of_unit", None)
+            func3 = getattr(self.__class__, "show_"+arg, None)
+            func4 = getattr(self.__class__, "system_"+arg, None)
+            func = func1 or func2 or func3 or func4
+            if func is None:
+                print("error: no such command '%s'" % arg)
+                okay = False
+            else:
+                doc_text = "..."
+                doc = getattr(func, "__doc__", None)
+                if doc:
+                    doc_text = doc.replace("\n","\n\n", 1).strip()
+                    if "--" not in doc_text:
+                        doc_text = "-- " + doc_text
+                else: 
+                    logg.debug("__doc__ of %s is none", func_name)
+                    if not self._show_all: continue
+                lines.append("%s %s %s" % (prog, arg, doc_text))
+        if not okay:
+            self.show_help()
+            return False
+        return lines
+    def systemd_version(self):
+        """ the version line for systemd compatibility """
+        return "systemd %s\n  - via systemctl.py %s" % (self._systemd_version, __version__)
+    def systemd_features(self):
+        """ the info line for systemd features """
+        features1 = "-PAM -AUDIT -SELINUX -IMA -APPARMOR -SMACK"
+        features2 = " +SYSVINIT -UTMP -LIBCRYPTSETUP -GCRYPT -GNUTLS"
+        features3 = " -ACL -XZ -LZ4 -SECCOMP -BLKID -ELFUTILS -KMOD -IDN"
+        return features1+features2+features3
+    def systems_version(self):
+        return [ self.systemd_version(), self.systemd_features() ]
+
+def print_result(result):
+    # logg_info = logg.info
+    # logg_debug = logg.debug
+    def logg_info(*msg): pass
+    def logg_debug(*msg): pass
+    exitcode = 0
+    if result is None:
+        logg_info("EXEC END None")
+    elif result is True:
+        logg_info("EXEC END True")
+        result = None
+        exitcode = 0
+    elif result is False:
+        logg_info("EXEC END False")
+        result = None
+        exitcode = 1
+    elif isinstance(result, tuple) and len(result) == 2:
+        exitcode, status = result
+        logg_info("EXEC END %s '%s'", exitcode, status)
+        if exitcode is True: exitcode = 0
+        if exitcode is False: exitcode = 1
+        result = status
+    elif isinstance(result, int):
+        logg_info("EXEC END %s", result)
+        exitcode = result
+        result = None
+    #
+    if result is None:
+        pass
+    elif isinstance(result, string_types):
+        print(result)
+        result1 = result.split("\n")[0][:-20]
+        if result == result1:
+            logg_info("EXEC END '%s'", result)
+        else:
+            logg_info("EXEC END '%s...'", result1)
+            logg_debug("    END '%s'", result)
+    elif isinstance(result, list) or hasattr(result, "next") or hasattr(result, "__next__"):
+        shown = 0
+        for element in result:
+            if isinstance(element, tuple):
+                print("\t".join([ str(elem) for elem in element] ))
+            else:
+                print(element)
+            shown += 1
+        logg_info("EXEC END %s items", shown)
+        logg_debug("    END %s", result)
+    elif hasattr(result, "keys"):
+        shown = 0
+        for key in sorted(result.keys()):
+            element = result[key]
+            if isinstance(element, tuple):
+                print(key,"=","\t".join([ str(elem) for elem in element]))
+            else:
+                print("%s=%s" % (key,element))
+            shown += 1
+        logg_info("EXEC END %s items", shown)
+        logg_debug("    END %s", result)
+    else:
+        logg.warning("EXEC END Unknown result type %s", str(type(result)))
+    return exitcode
+
+if __name__ == "__main__":
+    import optparse
+    _o = optparse.OptionParser("%prog [options] command [name...]", 
+        epilog="use 'help' command for more information")
+    _o.add_option("--version", action="store_true",
+        help="Show package version")
+    _o.add_option("--system", action="store_true", default=False,
+        help="Connect to system manager (default)") # overrides --user
+    _o.add_option("--user", action="store_true", default=_user_mode,
+        help="Connect to user service manager")
+    # _o.add_option("-H", "--host", metavar="[USER@]HOST",
+    #     help="Operate on remote host*")
+    # _o.add_option("-M", "--machine", metavar="CONTAINER",
+    #     help="Operate on local container*")
+    _o.add_option("-t","--type", metavar="TYPE", dest="unit_type", default=_unit_type,
+        help="List units of a particual type")
+    _o.add_option("--state", metavar="STATE", default=_unit_state,
+        help="List units with particular LOAD or SUB or ACTIVE state")
+    _o.add_option("-p", "--property", metavar="NAME", dest="unit_property", default=_unit_property,
+        help="Show only properties by this name")
+    _o.add_option("-a", "--all", action="store_true", dest="show_all", default=_show_all,
+        help="Show all loaded units/properties, including dead empty ones. To list all units installed on the system, use the 'list-unit-files' command instead")
+    _o.add_option("-l","--full", action="store_true", default=_full,
+        help="Don't ellipsize unit names on output (never ellipsized)")
+    _o.add_option("--reverse", action="store_true",
+        help="Show reverse dependencies with 'list-dependencies' (ignored)")
+    _o.add_option("--job-mode", metavar="MODE",
+        help="Specifiy how to deal with already queued jobs, when queuing a new job (ignored)")    
+    _o.add_option("--show-types", action="store_true",
+        help="When showing sockets, explicitly show their type (ignored)")
+    _o.add_option("-i","--ignore-inhibitors", action="store_true",
+        help="When shutting down or sleeping, ignore inhibitors (ignored)")
+    _o.add_option("--kill-who", metavar="WHO",
+        help="Who to send signal to (ignored)")
+    _o.add_option("-s", "--signal", metavar="SIG",
+        help="Which signal to send (ignored)")
+    _o.add_option("--now", action="store_true", default=_now,
+        help="Start or stop unit in addition to enabling or disabling it")
+    _o.add_option("-q","--quiet", action="store_true", default=_quiet,
+        help="Suppress output")
+    _o.add_option("--no-block", action="store_true", default=False,
+        help="Do not wait until operation finished (ignored)")
+    _o.add_option("--no-legend", action="store_true", default=_no_legend,
+        help="Do not print a legend (column headers and hints)")
+    _o.add_option("--no-wall", action="store_true", default=False,
+        help="Don't send wall message before halt/power-off/reboot (ignored)")
+    _o.add_option("--no-reload", action="store_true",
+        help="Don't reload daemon after en-/dis-abling unit files (ignored)")
+    _o.add_option("--no-ask-password", action="store_true", default=_no_ask_password,
+        help="Do not ask for system passwords")
+    # _o.add_option("--global", action="store_true", dest="globally", default=_globally,
+    #    help="Enable/disable unit files globally") # for all user logins
+    # _o.add_option("--runtime", action="store_true",
+    #     help="Enable unit files only temporarily until next reboot")
+    _o.add_option("-f", "--force", action="store_true", default=_force,
+        help="When enabling unit files, override existing symblinks / When shutting down, execute action immediately")
+    _o.add_option("--preset-mode", metavar="TYPE", default=_preset_mode,
+        help="Apply only enable, only disable, or all presets [%default]")
+    _o.add_option("--root", metavar="PATH", default=_root,
+        help="Enable unit files in the specified root directory (used for alternative root prefix)")
+    _o.add_option("-n","--lines", metavar="NUM",
+        help="Number of journal entries to show (ignored)")
+    _o.add_option("-o","--output", metavar="CAT",
+        help="change journal output mode [short, ..., cat] (ignored)")
+    _o.add_option("--plain", action="store_true",
+        help="Print unit dependencies as a list instead of a tree (ignored)")
+    _o.add_option("--no-pager", action="store_true",
+        help="Do not pipe output into pager (ignored)")
+    #
+    _o.add_option("--coverage", metavar="OPTIONLIST", default=COVERAGE,
+        help="..support for coverage (e.g. spawn,oldest,sleep) [%default]")
+    _o.add_option("-e","--extra-vars", "--environment", metavar="NAME=VAL", action="append", default=[],
+        help="..override settings in the syntax of 'Environment='")
+    _o.add_option("-v","--verbose", action="count", default=0,
+        help="..increase debugging information level")
+    _o.add_option("-4","--ipv4", action="store_true", default=False,
+        help="..only keep ipv4 localhost in /etc/hosts")
+    _o.add_option("-6","--ipv6", action="store_true", default=False,
+        help="..only keep ipv6 localhost in /etc/hosts")
+    _o.add_option("-1","--init", action="store_true", default=False,
+        help="..keep running as init-process (default if PID 1)")
+    opt, args = _o.parse_args()
+    logging.basicConfig(level = max(0, logging.FATAL - 10 * opt.verbose))
+    logg.setLevel(max(0, logging.ERROR - 10 * opt.verbose))
+    #
+    COVERAGE = opt.coverage
+    if "sleep" in COVERAGE:
+         MinimumTimeoutStartSec = 7
+         MinimumTimeoutStopSec = 7
+    if "quick" in COVERAGE:
+         MinimumTimeoutStartSec = 4
+         MinimumTimeoutStopSec = 4
+         DefaultTimeoutStartSec = 9
+         DefaultTimeoutStopSec = 9
+    _extra_vars = opt.extra_vars
+    _force = opt.force
+    _full = opt.full
+    _no_legend = opt.no_legend
+    _no_ask_password = opt.no_ask_password
+    _now = opt.now
+    _preset_mode = opt.preset_mode
+    _quiet = opt.quiet
+    _root = opt.root
+    _show_all = opt.show_all
+    _unit_state = opt.state
+    _unit_type = opt.unit_type
+    _unit_property = opt.unit_property
+    # being PID 1 (or 0) in a container will imply --init
+    _pid = os.getpid()
+    _init = opt.init or _pid in [ 1, 0 ]
+    _user_mode = opt.user
+    if os.geteuid() and _pid in [ 1, 0 ]:
+        _user_mode = True
+    if opt.system:
+        _user_mode = False # override --user
+    #
+    if _user_mode:
+        systemctl_debug_log = os_path(_root, _var_path(_systemctl_debug_log))
+        systemctl_extra_log = os_path(_root, _var_path(_systemctl_extra_log))
+    else:
+        systemctl_debug_log = os_path(_root, _systemctl_debug_log)
+        systemctl_extra_log = os_path(_root, _systemctl_extra_log)
+    if os.access(systemctl_extra_log, os.W_OK):
+        loggfile = logging.FileHandler(systemctl_extra_log)
+        loggfile.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logg.addHandler(loggfile)
+        logg.setLevel(max(0, logging.INFO - 10 * opt.verbose))
+    if os.access(systemctl_debug_log, os.W_OK):
+        loggfile = logging.FileHandler(systemctl_debug_log)
+        loggfile.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logg.addHandler(loggfile)
+        logg.setLevel(logging.DEBUG)
+    logg.info("EXEC BEGIN %s %s%s%s", os.path.realpath(sys.argv[0]), " ".join(args),
+        _user_mode and " --user" or " --system", _init and " --init" or "", )
+    #
+    #
+    systemctl = Systemctl()
+    if opt.version:
+        args = [ "version" ]
+    if not args:
+        if _init:
+            args = [ "default" ]
+        else:
+            args = [ "list-units" ]
+    logg.debug("======= systemctl.py " + " ".join(args))
+    command = args[0]
+    modules = args[1:]
+    try:
+        modules.remove("service")
+    except ValueError:
+        pass
+    if opt.ipv4:
+        systemctl.force_ipv4()
+    elif opt.ipv6:
+        systemctl.force_ipv6()
+    found = False
+    # command NAME
+    if command.startswith("__"):
+        command_name = command[2:]
+        command_func = getattr(systemctl, command_name, None)
+        if callable(command_func) and not found:
+            found = True
+            result = command_func(*modules)
+    command_name = command.replace("-","_").replace(".","_")+"_modules"
+    command_func = getattr(systemctl, command_name, None)
+    if callable(command_func) and not found:
+        systemctl.wait_boot(command_name)
+        found = True
+        result = command_func(*modules)
+    command_name = "show_"+command.replace("-","_").replace(".","_")
+    command_func = getattr(systemctl, command_name, None)
+    if callable(command_func) and not found:
+        systemctl.wait_boot(command_name)
+        found = True
+        result = command_func(*modules)
+    command_name = "system_"+command.replace("-","_").replace(".","_")
+    command_func = getattr(systemctl, command_name, None)
+    if callable(command_func) and not found:
+        systemctl.wait_boot(command_name)
+        found = True
+        result = command_func()
+    command_name = "systems_"+command.replace("-","_").replace(".","_")
+    command_func = getattr(systemctl, command_name, None)
+    if callable(command_func) and not found:
+        systemctl.wait_boot(command_name)
+        found = True
+        result = command_func()
+    if not found:
+        logg.error("Unknown operation %s.", command)
+        sys.exit(1)
+    #
+    sys.exit(print_result(result)) get_runtime_dir())
                 CONFIG = os.environ.get("XDG_CONFIG_HOME", HOME + "/.config")
                 CACHE = os.environ.get("XDG_CACHE_HOME", HOME + "/.cache")
                 SHARE = os.environ.get("XDG_DATA_HOME", HOME + "/.local/share")
@@ -4409,136 +7417,4 @@ if __name__ == "__main__":
     # _o.add_option("--runtime", action="store_true",
     #     help="Enable unit files only temporarily until next reboot")
     _o.add_option("--force", action="store_true", default=_force,
-        help="When enabling unit files, override existing symblinks / When shutting down, execute action immediately")
-    _o.add_option("--preset-mode", metavar="TYPE", default=_preset_mode,
-        help="Apply only enable, only disable, or all presets [%default]")
-    _o.add_option("--root", metavar="PATH", default=_root,
-        help="Enable unit files in the specified root directory (used for alternative root prefix)")
-    _o.add_option("-n","--lines", metavar="NUM",
-        help="Number of journal entries to show (ignored)")
-    _o.add_option("-o","--output", metavar="CAT",
-        help="change journal output mode [short, ..., cat] (ignored)")
-    _o.add_option("--plain", action="store_true",
-        help="Print unit dependencies as a list instead of a tree (ignored)")
-    _o.add_option("--no-pager", action="store_true",
-        help="Do not pipe output into pager (ignored)")
-    #
-    _o.add_option("--coverage", metavar="OPTIONLIST", default=COVERAGE,
-        help="..support for coverage (e.g. spawn,oldest,sleep) [%default]")
-    _o.add_option("-e","--extra-vars", "--environment", metavar="NAME=VAL", action="append", default=[],
-        help="..override settings in the syntax of 'Environment='")
-    _o.add_option("-v","--verbose", action="count", default=0,
-        help="..increase debugging information level")
-    _o.add_option("-4","--ipv4", action="store_true", default=False,
-        help="..only keep ipv4 localhost in /etc/hosts")
-    _o.add_option("-6","--ipv6", action="store_true", default=False,
-        help="..only keep ipv6 localhost in /etc/hosts")
-    _o.add_option("-1","--init", action="store_true", default=False,
-        help="..keep running as init-process (default if PID 1)")
-    opt, args = _o.parse_args()
-    logging.basicConfig(level = max(0, logging.FATAL - 10 * opt.verbose))
-    logg.setLevel(max(0, logging.ERROR - 10 * opt.verbose))
-    #
-    COVERAGE = opt.coverage
-    if "sleep" in COVERAGE:
-         MinimumTimeoutStartSec = 7
-         MinimumTimeoutStopSec = 7
-    if "quick" in COVERAGE:
-         MinimumTimeoutStartSec = 4
-         MinimumTimeoutStopSec = 4
-         DefaultTimeoutStartSec = 9
-         DefaultTimeoutStopSec = 9
-    _extra_vars = opt.extra_vars
-    _force = opt.force
-    _full = opt.full
-    _no_legend = opt.no_legend
-    _no_ask_password = opt.no_ask_password
-    _now = opt.now
-    _preset_mode = opt.preset_mode
-    _quiet = opt.quiet
-    _root = opt.root
-    _show_all = opt.show_all
-    _unit_state = opt.state
-    _unit_type = opt.unit_type
-    _unit_property = opt.unit_property
-    # being PID 1 (or 0) in a container will imply --init
-    _pid = os.getpid()
-    _init = opt.init or _pid in [ 1, 0 ]
-    _user_mode = opt.user
-    if os.geteuid() and _pid in [ 1, 0 ]:
-        _user_mode = True
-    if opt.system:
-        _user_mode = False # override --user
-    #
-    if _user_mode:
-        systemctl_debug_log = os_path(_root, _var_path(_systemctl_debug_log))
-        systemctl_extra_log = os_path(_root, _var_path(_systemctl_extra_log))
-    else:
-        systemctl_debug_log = os_path(_root, _systemctl_debug_log)
-        systemctl_extra_log = os_path(_root, _systemctl_extra_log)
-    if os.access(systemctl_extra_log, os.W_OK):
-        loggfile = logging.FileHandler(systemctl_extra_log)
-        loggfile.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logg.addHandler(loggfile)
-        logg.setLevel(max(0, logging.INFO - 10 * opt.verbose))
-    if os.access(systemctl_debug_log, os.W_OK):
-        loggfile = logging.FileHandler(systemctl_debug_log)
-        loggfile.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logg.addHandler(loggfile)
-        logg.setLevel(logging.DEBUG)
-    logg.info("EXEC BEGIN %s %s%s%s", os.path.realpath(sys.argv[0]), " ".join(args),
-        _user_mode and " --user" or " --system", _init and " --init" or "", )
-    #
-    #
-    systemctl = Systemctl()
-    if opt.version:
-        args = [ "version" ]
-    if not args:
-        if _init:
-            args = [ "default" ]
-        else:
-            args = [ "list-units" ]
-    logg.debug("======= systemctl.py " + " ".join(args))
-    command = args[0]
-    modules = args[1:]
-    if opt.ipv4:
-        systemctl.force_ipv4()
-    elif opt.ipv6:
-        systemctl.force_ipv6()
-    found = False
-    # command NAME
-    if command.startswith("__"):
-        command_name = command[2:]
-        command_func = getattr(systemctl, command_name, None)
-        if callable(command_func) and not found:
-            found = True
-            result = command_func(*modules)
-    command_name = command.replace("-","_").replace(".","_")+"_modules"
-    command_func = getattr(systemctl, command_name, None)
-    if callable(command_func) and not found:
-        systemctl.wait_boot(command_name)
-        found = True
-        result = command_func(*modules)
-    command_name = "show_"+command.replace("-","_").replace(".","_")
-    command_func = getattr(systemctl, command_name, None)
-    if callable(command_func) and not found:
-        systemctl.wait_boot(command_name)
-        found = True
-        result = command_func(*modules)
-    command_name = "system_"+command.replace("-","_").replace(".","_")
-    command_func = getattr(systemctl, command_name, None)
-    if callable(command_func) and not found:
-        systemctl.wait_boot(command_name)
-        found = True
-        result = command_func()
-    command_name = "systems_"+command.replace("-","_").replace(".","_")
-    command_func = getattr(systemctl, command_name, None)
-    if callable(command_func) and not found:
-        systemctl.wait_boot(command_name)
-        found = True
-        result = command_func()
-    if not found:
-        logg.error("Unknown operation %s.", command)
-        sys.exit(1)
-    #
-    sys.exit(print_result(result))
+        help="When enabling unit files, override existing symblinks / When shut
