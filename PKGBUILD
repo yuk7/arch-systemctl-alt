@@ -3,7 +3,7 @@
 pkgname=systemd-altctl
 _pkgname=systemd
 pkgver=1.4.4181
-pkgrel=1
+pkgrel=2
 _pkgver=219.0
 _pkgrel=1
 pkgdesc='systemd systemctl alternative package'
