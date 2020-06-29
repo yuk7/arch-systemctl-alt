@@ -12,10 +12,10 @@ license=('EUPL')
 url="https://github.com/gdraheim/docker-systemctl-replacement"
 groups=('base')
 depends=('python' 'systemd-libs')
-provides=("${_pkgname}=${_pkgver}-${_pkgrel}")
+provides=("${_pkgname}=${_pkgver}-${_pkgrel}" "systemd-tools=${_pkgver}" "udev=${_pkgver}")
 conflicts=("${_pkgname}")
 source=(systemctl.py)
-md5sums=('0002faf35c345348f0d0a8ad328d86f1')
+md5sums=('8eee6334850a44ae051fb1cf32d93f45')
 
 package() {
   install -Dm755 systemctl.py "$pkgdir"/usr/bin/systemctl
